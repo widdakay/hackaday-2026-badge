@@ -95,7 +95,8 @@ _GRAPH_R = 21
 _GRAPH_BOX = (_RIGHT_X, _SPLIT_Y + 4, display_width, display_height)
 _GRAPH_PAD = _GRAPH_R + 8
 _SCALE_BAR_H = 26           # reserved below the plot for the scale bar
-_NICE_METRES = (0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100)
+_NICE_METRES = (1, 2, 5, 10, 20, 50, 100)   # scale bar lengths, 1 m at least
+_SCALE_BAR_MAX = 130          # px
 
 # LEDs: the firefly flash (lib/firefly.py) while the app is open, dark
 # between flashes. Other apps keep the LEDs to themselves.
@@ -555,6 +556,9 @@ class RangingApp(BaseApp):
         sx = (right - left) / span_x if span_x > 1e-6 else None
         sy = (bottom - top) / span_y if span_y > 1e-6 else None
         scale = min([s for s in (sx, sy) if s is not None] or [1.0])
+        # Zoom in no further than a 1 m scale bar fits: nodes close together
+        # stay close on screen instead of being spread across the pane.
+        scale = min(scale, _SCALE_BAR_MAX)
         cx_m, cy_m = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
         cx_px, cy_px = (left + right) / 2, (top + bottom) / 2
 
@@ -590,17 +594,17 @@ class RangingApp(BaseApp):
             _circle(scr, x, y, _GRAPH_R, n, _GRAPH_NUM_FONT, n == 0)
 
         # Scale bar: the largest round length that fits in 130 px.
-        metres = None
+        metres = _NICE_METRES[0]
         for m in _NICE_METRES:
-            if m * scale <= 130:
+            if m * scale <= _SCALE_BAR_MAX:
                 metres = m
-        if metres is not None and metres * scale >= 12:
+        if metres * scale >= 12:
             bar = int(metres * scale)
             by = y1 - 18
             _rect(scr, left, by, bar, 4)
             _rect(scr, left, by - 8, 3, 12)
             _rect(scr, left + bar - 3, by - 8, 3, 12)
-            text = ("%g m" % metres) if metres >= 1 else ("%d cm" % int(metres * 100))
+            text = "%d m" % metres
             _label(scr, left + bar + 8, by - 10, text, _NOTE_FONT)
 
         # Fit quality, bottom right: RMS of (measured - map) over the edges.

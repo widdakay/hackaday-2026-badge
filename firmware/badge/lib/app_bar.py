@@ -22,6 +22,7 @@ except Exception as ex:          # no ADC (e.g. a PC test) or a broken battery m
 HEIGHT = 40          # bar plus its bottom rule
 BATTERY_X = display_width - 56   # byte-aligned (multiple of 8), right end of the bar
 BATTERY_Y = 7
+VERSION_PATH = "/version.txt"   # written by scripts/update.py push (git describe)
 _RULE = 3
 _FONT = lvgl.font_montserrat_16   # sizes in firmware: 14, 16, 24, 28, ...
 _PAD_X = 12          # inside each name's box
@@ -34,6 +35,15 @@ _tabs = []           # (box, label) per app
 _active = None
 _cursor = None
 _painted = None      # (active, cursor) last drawn into the framebuffer
+
+
+def version():
+    """The badge files' version: the git commit they were pushed from."""
+    try:
+        with open(VERSION_PATH) as f:
+            return f.read().strip() or "dev"
+    except OSError:
+        return "dev"
 
 
 def setup(names):
@@ -54,6 +64,14 @@ def setup(names):
     rule.set_size(display_width, _RULE)
     rule.set_style_bg_color(_BLACK, 0)
     rule.set_style_bg_opa(lvgl.OPA.COVER, 0)
+
+    # Version, right-aligned just left of the battery icon.
+    ver = lvgl.label(_bar)
+    ver.set_style_text_font(lvgl.font_montserrat_14, 0)
+    ver.set_style_text_color(_BLACK, 0)
+    ver.set_text(version())
+    ver.update_layout()
+    ver.set_pos(BATTERY_X - 10 - ver.get_width(), (HEIGHT - _RULE - ver.get_height()) // 2)
 
     _tabs = []
     x = 8

@@ -352,6 +352,17 @@ class RangingService:
         except OSError as ex:
             print("DIST,%s,%s,start_err,,,,,0,,,," % (mac_str(self.mac), mac_str(peer.mac)))
             log.error("ranging: ftm.start", ex)
+            # A report that raced a timeout's cancel() can leave the module
+            # holding a result nobody collects (older firmware), and then every
+            # start is refused with ESP_ERR_INVALID_STATE and this badge stops
+            # ranging for good. Drop it so the next session can start.
+            try:
+                ftm.poll()
+                if ftm.busy():
+                    ftm.cancel()
+            except OSError:
+                pass
+            await aio.sleep_ms(50)
             return
         try:
             await aio.wait_for_ms(self._ftm_ready.wait(), SESSION_TIMEOUT_MS)

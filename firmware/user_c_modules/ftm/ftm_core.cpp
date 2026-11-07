@@ -19,12 +19,18 @@ bool g_handler_registered = false;
 std::atomic<void (*)(void)> g_done_cb{nullptr};
 
 void on_ftm_report(void *, esp_event_base_t, int32_t, void *data) {
-    if (g_state.load() != FTM_CORE_RUNNING) {
+    // Claim the report only if a session is still running. A plain load then
+    // store raced ftm_core_cancel(): a report landing while a timed-out
+    // session was being cancelled could set DONE after cancel set IDLE, and
+    // nothing ever polled it, so every later start failed (INVALID_STATE).
+    // g_report is only read in DONE, and no session runs then, so writing it
+    // before the exchange is safe.
+    g_report = *static_cast<wifi_event_ftm_report_t *>(data);
+    int expected = FTM_CORE_RUNNING;
+    if (!g_state.compare_exchange_strong(expected, FTM_CORE_DONE)) {
         esp_wifi_ftm_get_report(nullptr, 0);  // stray report: just free it
         return;
     }
-    g_report = *static_cast<wifi_event_ftm_report_t *>(data);
-    g_state.store(FTM_CORE_DONE);
     if (auto cb = g_done_cb.load()) cb();
 }
 
@@ -107,10 +113,16 @@ extern "C" int ftm_core_poll(ftm_result_t *out) {
 extern "C" int ftm_core_state(void) { return g_state.load(); }
 
 extern "C" int ftm_core_cancel(void) {
-    if (g_state.load() != FTM_CORE_RUNNING) return ESP_OK;
-    esp_err_t err = esp_wifi_ftm_end_session();
-    g_state.store(FTM_CORE_IDLE);
-    return err;
+    int expected = FTM_CORE_RUNNING;
+    if (g_state.compare_exchange_strong(expected, FTM_CORE_IDLE)) {
+        return esp_wifi_ftm_end_session();
+    }
+    if (expected == FTM_CORE_DONE) {
+        // The report beat the cancel: drop it, or the next start is refused.
+        esp_wifi_ftm_get_report(nullptr, 0);
+        g_state.store(FTM_CORE_IDLE);
+    }
+    return ESP_OK;
 }
 
 extern "C" void ftm_core_set_done_cb(void (*cb)(void)) { g_done_cb.store(cb); }

@@ -63,6 +63,13 @@ if __name__ == "__main__":
         exit(1)
 
     if args.action == "push":
+        # Version shown in the app bar (lib/app_bar.py); gitignored.
+        ver = subprocess.run(["git", "describe", "--always", "--dirty", "--exclude=*"],
+                             capture_output=True, text=True).stdout.strip()
+        if ver:
+            with open("badge/version.txt", "w") as f:
+                f.write(ver + "\n")
+            print(f"Version {ver}")
         print("Checking badge/ directory...")
         local_files = check_dir("badge")
         print("Checking files on badge...")
