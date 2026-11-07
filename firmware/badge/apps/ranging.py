@@ -10,15 +10,24 @@ The screen has three panes:
                 (lib.graph_layout), autoscaled, numbered like the list
 
 The first launch starts lib.ranging's background service, which keeps
-measuring after you switch apps. The screen redraws with the fast black/white
-refresh (about 4 s instead of about 35) whenever what it shows changes, at most
-every REDRAW_MS, and only after the previous refresh has finished. While the
-app is open the LED bar runs a red Cylon sweep.
+measuring after you switch apps. While the app is open the LED bar runs a red
+Cylon sweep.
+
+Live mode (from the main branch's Ranging): the panel stays powered
+(display.keep_powered) and the screen redraws once per full pass over the
+peer list, so the whole table and map are from one pass, and at once when a
+node appears or drops out. Frames use the differential table
+(display.update(differential=True), ~1.2 s of waveform): only pixels that
+changed are driven, DC-balanced, so static parts (nametag, labels) get no
+charge and don't ghost. Every CLEAN_EVERY frames, and whenever the layout
+changes, a balanced flash (inverted frame, then the real one) wipes the light
+ghosts the short drive leaves on changed pixels.
 
 Distances are raw FTM readings and not calibrated yet. Expect a fixed offset
 of a few metres that depends on the chip types involved.
 """
 
+import asyncio as aio
 import math
 import time
 
@@ -28,7 +37,7 @@ from apps.base_app import BaseApp
 from lib import app_bar, graph_layout
 from lib.epd import display, display_height, display_width
 from lib.led_bar import NUM_LEDS, leds
-from lib.ranging import CHANNEL, service
+from lib.ranging import CHANNEL, HISTORY, service
 
 _BG = lvgl.color_hex(0xFFFFFF)
 _FG = lvgl.color_hex(0x000000)
@@ -42,7 +51,8 @@ _NOTE_FONT = lvgl.font_montserrat_14
 _LIST_NUM_FONT = lvgl.font_montserrat_16
 _GRAPH_NUM_FONT = lvgl.font_montserrat_24
 
-REDRAW_MS = 10000           # fast refresh takes ~4-7 s; leave a gap
+MIN_GAP_MS = 300            # between the end of one frame and the next
+CLEAN_EVERY = 8             # live frames between balanced-flash cleans
 
 _TITLE = "I've found"        # on-screen title; the app itself is still "Ranging"
 
@@ -70,9 +80,13 @@ _GRAPH_PAD = _GRAPH_R + 8
 _SCALE_BAR_H = 26           # reserved below the plot for the scale bar
 _NICE_METRES = (0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100)
 
-# LEDs: red Cylon sweep.
+# LEDs: red Cylon sweep while the app is open; once ranging has started, the
+# nearest-node meter (from the main branch) while any other app is running.
 _CYLON_MS = 70
 _CYLON_TRAIL = (16, 4, 1)   # head, then fading tail (the LEDs are bright)
+_METER_COLOR = (0, 2, 0)
+_METRES_PER_LED = 1.0
+_METER_MS = 500
 
 
 def _cylon():
@@ -87,6 +101,32 @@ def _cylon():
                 vals[idx] = (level, 0, 0)
         yield vals, _CYLON_MS
         step = (step + 1) % len(path)
+
+
+def _meter_leds():
+    """Nearest node as a green bar: more LEDs = closer."""
+    peers = service.live_peers()
+    d = service.distance(peers[0].mac) if peers else None
+    vals = [(0, 0, 0)] * NUM_LEDS
+    if d is not None:
+        lit = max(1, NUM_LEDS - int(d / _METRES_PER_LED))
+        vals = [_METER_COLOR if i < lit else (0, 0, 0) for i in range(NUM_LEDS)]
+    leds.set(vals)
+    leds.write()
+
+
+async def _meter_task(app):
+    """Show the meter whenever another app is running (not in the app menu,
+    which uses the LEDs itself, and not in this app, which runs the Cylon)."""
+    from lib.app_switcher import switcher
+    while True:
+        await aio.sleep_ms(_METER_MS)
+        try:
+            active = switcher.apps[switcher.active_idx]
+            if not switcher.selecting_mode and active is not app:
+                _meter_leds()
+        except Exception as ex:
+            print("ranging: LED meter failed:", ex)
 
 
 def _label(parent, x, y, text, font, color=_FG, w=None):
@@ -143,23 +183,43 @@ class RangingApp(BaseApp):
         self.sleep_ms = 500
         self._drawn_ms = time.ticks_ms()
         self._drawn_key = None
+        self._drawn_nodes = None    # node set on screen; a change redraws at once
+        self._drawn_passes = -1     # service.passes at the last frame
+        self._drawn_layout = None   # None = next frame is a plain fast refresh
+        self._live_frames = 0
+        self._meter = None          # background LED meter task, started on launch
         self._scr = None
-        self._keep = []          # line point arrays LVGL still points at
+        self._edges = []         # map edges to draw after LVGL, see _draw_edges
         self._pos = {}           # mac -> (x, y) metres from the last layout
 
     def run(self):
         if self.launched:
             service.start()
+            # Keep the booster up between frames: skips ~2.5 s of reset, init and
+            # power-up per frame. The driver closes the session after 60 s idle
+            # or on a slow (red) refresh from another app.
+            display.keep_powered = True
             leds.unpause()       # the app menu pauses the sequencer
             leds.set_sequence(_cylon)
+            if self._meter is None:
+                self._meter = aio.create_task(_meter_task(self))
+            self._drawn_layout = None  # first frame is always a plain one
             self._draw()
             return
         if not display.is_done_updating():
+            self._drawn_ms = time.ticks_ms()  # gap counts from the end of a frame
             return
-        if time.ticks_diff(time.ticks_ms(), self._drawn_ms) < REDRAW_MS:
+        if time.ticks_diff(time.ticks_ms(), self._drawn_ms) < MIN_GAP_MS:
+            return
+        # One frame per full pass over the peer list, so every number on screen
+        # is from the same pass; at once when the nodes shown change.
+        nodes, _ = service.graph()
+        if set(nodes) == self._drawn_nodes and service.passes == self._drawn_passes:
             return
         if self._key() != self._drawn_key:
             self._draw()
+        else:
+            self._drawn_passes = service.passes
 
     # ---- what's on screen ---------------------------------------------------
     def _rows(self, nodes, edges):
@@ -189,7 +249,7 @@ class RangingApp(BaseApp):
                 dist = ("via %d" % min(via)) if via else "..."
             p = now_peers.get(mac)
             # RSSI in 5 dB steps: it jitters by a dB or two with every beacon,
-            # which would otherwise redraw the screen every REDRAW_MS.
+            # which would otherwise force a redraw on every pass.
             sig = str(-((-p.rssi + 2) // 5 * 5)) if p is not None and p.rssi else ""
             order = (1, round(d, 1), n) if d is not None else (2, 0, n)
             keyed.append((order, (n, _short(name), dist, sig)))
@@ -221,7 +281,7 @@ class RangingApp(BaseApp):
         scr.set_size(display_width, display_height)
         scr.set_style_bg_color(_BG, 0)
         scr.set_style_bg_opa(lvgl.OPA.COVER, 0)
-        self._keep = []
+        self._edges = []
 
         _rect(scr, _SPLIT_X, _TOP, 4, display_height - _TOP)
         _rect(scr, _RIGHT_X, _SPLIT_Y, display_width - _RIGHT_X, 4)
@@ -235,15 +295,30 @@ class RangingApp(BaseApp):
         self._scr = scr
         scr.update_layout()
         lvgl.refr_now(display.lv_display)
+        self._draw_edges(display.black)
         # The nametag goes on after LVGL, which paints its whole screen.
         try:
             display.draw_png(_NAMETAG, _TOP, _RIGHT_X)
         except OSError:
             print("ranging: %s missing, run scripts/make_nametag.py" % _NAMETAG)
-        # Black and white only, so the short waveform loses nothing.
-        display.update(fast=True)
+        # Black and white only, so the short waveforms lose nothing.
+        layout = (len(nodes), len(rows) > 1)
+        if self._drawn_layout is None:
+            # First frame after launch: a normal fast refresh (slow once if red
+            # is on the panel) so the driver knows what the panel shows.
+            display.update(fast=True)
+            self._live_frames = 0
+        elif layout != self._drawn_layout or self._live_frames >= CLEAN_EVERY:
+            display.update(fast=True, differential=True, flash=True)
+            self._live_frames = 0
+        else:
+            display.update(fast=True, differential=True)
+            self._live_frames += 1
+        self._drawn_layout = layout
         self._drawn_ms = time.ticks_ms()
         self._drawn_key = key
+        self._drawn_nodes = set(nodes)
+        self._drawn_passes = service.passes
 
     def _draw_list(self, scr, rows, n_nodes):
         _label(scr, _PAD, _TOP + 12, _TITLE, _TITLE_FONT)
@@ -268,8 +343,72 @@ class RangingApp(BaseApp):
             _label(scr, _PAD, y + 40, "Other badges need the Ranging app open,", _NOTE_FONT)
             _label(scr, _PAD, y + 62, "C3 boards need the ftm_node firmware.", _NOTE_FONT)
 
-        _label(scr, _PAD, display_height - 50, "Raw Wi-Fi FTM, not calibrated. Median of last 5.", _NOTE_FONT)
+        _label(scr, _PAD, display_height - 50, self._timing(), _NOTE_FONT)
         _label(scr, _PAD, display_height - 28, "Numbers match the circles in the map.", _NOTE_FONT)
+
+    def _draw_edges(self, fb):
+        """Edges as 3 px lines in the framebuffer, broken wherever they would
+        cross a node circle or their own distance label."""
+        r = _GRAPH_R + 2
+        for ax, ay, bx, by, box, centres in self._edges:
+            dx, dy = bx - ax, by - ay
+            length2 = dx * dx + dy * dy
+            if length2 == 0:
+                continue
+            holes = []
+            for cx, cy in centres:          # t-ranges inside each circle
+                fx, fy = ax - cx, ay - cy
+                b = fx * dx + fy * dy
+                c = fx * fx + fy * fy - r * r
+                disc = b * b - length2 * c
+                if disc > 0:
+                    sq = math.sqrt(disc)
+                    holes.append(((-b - sq) / length2, (-b + sq) / length2))
+            if box is not None:             # Liang-Barsky against the label
+                t0, t1 = 0.0, 1.0
+                for p, q in ((-dx, ax - box[0]), (dx, box[2] - ax),
+                             (-dy, ay - box[1]), (dy, box[3] - ay)):
+                    if p == 0:
+                        if q < 0:
+                            t0, t1 = 1.0, 0.0
+                    else:
+                        t = q / p
+                        if p < 0:
+                            t0 = max(t0, t)
+                        else:
+                            t1 = min(t1, t)
+                if t0 < t1:
+                    holes.append((t0, t1))
+            holes.sort()
+            t = 0.0
+            spans = []
+            for h0, h1 in holes:
+                if h0 > t:
+                    spans.append((t, min(h0, 1.0)))
+                t = max(t, h1)
+            if t < 1.0:
+                spans.append((t, 1.0))
+            horizontal = abs(dx) >= abs(dy)
+            for s0, s1 in spans:
+                if s1 - s0 <= 0:
+                    continue
+                x0, y0 = int(ax + dx * s0), int(ay + dy * s0)
+                x1, y1 = int(ax + dx * s1), int(ay + dy * s1)
+                for o in (-1, 0, 1):        # 3 px thick
+                    if horizontal:
+                        fb.line(x0, y0 + o, x1, y1 + o, 1)
+                    else:
+                        fb.line(x0 + o, y0, x1 + o, y1, 1)
+
+    def _timing(self):
+        """Footer: how long the median window is (a median of 3 means little
+        without knowing whether 3 readings took 8 s or a minute). Pass time in
+        0.5 s steps, so its jitter does not force a redraw."""
+        if service.pass_ms is None or not service.pass_peers:
+            return "Raw FTM, uncalibrated. Median of last %d passes." % HISTORY
+        pass_s = max(0.5, round(service.pass_ms / 500) / 2)
+        return "Raw FTM, uncalibrated. Median of %d passes, ~%d s." % (
+            HISTORY, round(pass_s * HISTORY))
 
     def _draw_graph(self, scr, nodes, edges):
         x0, y0, x1, y1 = _GRAPH_BOX
@@ -304,29 +443,28 @@ class RangingApp(BaseApp):
             x, y = pos[mac]
             return int(cx_px + (x - cx_m) * scale), int(cy_px - (y - cy_m) * scale)
 
-        # Draw order is creation order: lines, then edge labels, then circles.
-        for (a, b) in edges:
-            if a in pos and b in pos:
-                (ax, ay), (bx, by) = px(a), px(b)
-                pts = [lvgl.point_precise_t({"x": ax, "y": ay}),
-                       lvgl.point_precise_t({"x": bx, "y": by})]
-                self._keep.append(pts)
-                line = lvgl.line(scr)
-                line.set_points(pts, 2)
-                line.set_pos(0, 0)
-                line.set_style_line_width(3, 0)
-                line.set_style_line_color(_FG, 0)
+        # Circles and edge labels are LVGL widgets; the edges themselves are
+        # drawn into the framebuffer afterwards (_draw_edges), around them.
+        # (LVGL line widgets keep a pointer to their point array, and the
+        # MicroPython binding's converted array isn't kept alive: after a GC
+        # the badge drew garbage lines and hung.)
+        centres = [px(m) for m in placed]
         for (a, b), d in edges.items():
-            if a in pos and b in pos:
-                (ax, ay), (bx, by) = px(a), px(b)
-                if math.sqrt((ax - bx) ** 2 + (ay - by) ** 2) < 2 * _GRAPH_R + 36:
-                    continue  # no room between the circles for a label
+            if a not in pos or b not in pos:
+                continue
+            (ax, ay), (bx, by) = px(a), px(b)
+            box = None
+            if math.sqrt((ax - bx) ** 2 + (ay - by) ** 2) >= 2 * _GRAPH_R + 36:
                 lbl = _label(scr, 0, 0, _fmt_m(d), _NOTE_FONT)
                 lbl.set_style_bg_color(_BG, 0)
                 lbl.set_style_bg_opa(lvgl.OPA.COVER, 0)
                 lbl.set_style_pad_hor(3, 0)
                 lbl.update_layout()
-                lbl.set_pos((ax + bx) // 2 - lbl.get_width() // 2, (ay + by) // 2 - lbl.get_height() // 2)
+                w, h = lbl.get_width(), lbl.get_height()
+                lx, ly = (ax + bx) // 2 - w // 2, (ay + by) // 2 - h // 2
+                lbl.set_pos(lx, ly)
+                box = (lx, ly, lx + w, ly + h)
+            self._edges.append((ax, ay, bx, by, box, centres))
         for mac in placed:
             n = service.number_of(mac)
             x, y = px(mac)
