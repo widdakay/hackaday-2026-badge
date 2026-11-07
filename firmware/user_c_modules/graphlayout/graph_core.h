@@ -19,12 +19,17 @@ extern "C" {
 // (seeded by `seed`) and keeps the best; a restart has to beat the given
 // start's stress by `margin` (0.2 = 20 %), so a good previous layout stays put.
 //
+// mds_start != 0 replaces the given start with a classical MDS layout
+// (shortest paths fill unmeasured pairs). Relaxing stops early once no node
+// moves more than 1e-4 x the longest edge.
+//
 // Returns the weighted stress sum((|xi - xj| - d)^2 / d^2), or -1 on bad input
 // (n > GRAPH_MAX_NODES, an edge index >= n). Isolated nodes don't move.
 #define GRAPH_MAX_NODES 64
 float graph_core_solve(int n, float *xs, float *ys,
                        int m, const uint16_t *ei, const uint16_t *ej, const float *ed,
-                       int iterations, int restarts, float margin, uint32_t seed);
+                       int iterations, int restarts, float margin, uint32_t seed,
+                       int mds_start);
 
 #ifdef __cplusplus
 }

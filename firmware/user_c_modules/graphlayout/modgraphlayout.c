@@ -6,7 +6,8 @@
 //   ei = array('H', ...); ej = array('H', ...)        # edge endpoints, m each
 //   ed = array('f', ...)                              # edge lengths, metres
 //   stress = graphlayout.solve(xs, ys, ei, ej, ed, iterations=200,
-//                              restarts=0, margin=0.2, seed=1)
+//                              restarts=0, margin=0.2, seed=1, mds=False)
+//   # mds=True ignores the start in xs/ys and uses classical MDS instead
 //   # xs, ys now hold the layout
 //
 // Blocks for the whole solve: about a millisecond for ten nodes with a few
@@ -23,7 +24,7 @@ static void get_buf(mp_obj_t obj, mp_buffer_info_t *info, char typecode, const c
 }
 
 static mp_obj_t graphlayout_solve(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    enum { ARG_xs, ARG_ys, ARG_ei, ARG_ej, ARG_ed, ARG_iterations, ARG_restarts, ARG_margin, ARG_seed };
+    enum { ARG_xs, ARG_ys, ARG_ei, ARG_ej, ARG_ed, ARG_iterations, ARG_restarts, ARG_margin, ARG_seed, ARG_mds };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_xs, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
         { MP_QSTR_ys, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
@@ -34,6 +35,7 @@ static mp_obj_t graphlayout_solve(size_t n_args, const mp_obj_t *pos_args, mp_ma
         { MP_QSTR_restarts, MP_ARG_INT, {.u_int = 0} },
         { MP_QSTR_margin, MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
         { MP_QSTR_seed, MP_ARG_INT, {.u_int = 1} },
+        { MP_QSTR_mds, MP_ARG_BOOL, {.u_bool = false} },
     };
     mp_arg_val_t a[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, a);
@@ -53,7 +55,7 @@ static mp_obj_t graphlayout_solve(size_t n_args, const mp_obj_t *pos_args, mp_ma
 
     float s = graph_core_solve((int)n, xs.buf, ys.buf, (int)m, ei.buf, ej.buf, ed.buf,
                                a[ARG_iterations].u_int, a[ARG_restarts].u_int, margin,
-                               (uint32_t)a[ARG_seed].u_int);
+                               (uint32_t)a[ARG_seed].u_int, a[ARG_mds].u_bool);
     if (s < 0.0f) {
         mp_raise_ValueError(MP_ERROR_TEXT("too many nodes or edge index out of range"));
     }

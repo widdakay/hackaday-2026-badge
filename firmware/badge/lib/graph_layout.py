@@ -39,8 +39,9 @@ try:
 except ImportError:
     graphlayout = None
 
-C_ITERATIONS = 300      # the C++ solver is ~1000x faster; afford a lot more
-C_RESTARTS = 12
+C_ITERATIONS = 300      # cap; the C++ solver stops early once converged
+C_RESTARTS = 12         # fresh solves only
+BAD_FIT = 0.15          # RMS relative edge error that triggers a fresh solve
 
 try:
     _ticks, _diff = time.ticks_ms, time.ticks_diff
@@ -81,23 +82,7 @@ def layout(nodes, edges, prev=None, iterations=ITERATIONS, budget_ms=BUDGET_MS):
     # one, start from it only, so the picture stays put and stays cheap.
     common = [m for m in ids if m in prev]
     if graphlayout is not None and n <= graphlayout.MAX_NODES:
-        start = _initial(ids, adj, prev)
-        xs = array("f", [start[m][0] for m in ids])
-        ys = array("f", [start[m][1] for m in ids])
-        ei, ej, ed = array("H"), array("H"), array("f")
-        for (a, b), d in edges.items():
-            if a != b and d is not None and a in idx and b in idx:
-                ei.append(idx[a])
-                ej.append(idx[b])
-                ed.append(d)
-        # With a previous layout, restarts must clearly beat it (margin) so
-        # the picture only jumps when the old shape was really folded.
-        graphlayout.solve(xs, ys, ei, ej, ed, iterations=C_ITERATIONS,
-                          restarts=C_RESTARTS, margin=RESTART_MARGIN if common else 0.0)
-        pos = {m: (xs[k], ys[k]) for k, m in enumerate(ids)}
-        if len(common) >= 2:
-            return _align(pos, prev, common)
-        return _gauge(pos, ids)
+        return _layout_c(ids, adj, idx, edges, prev, common)
 
     restarts = 0 if len(common) >= 2 else RESTARTS
     best = None
@@ -115,6 +100,42 @@ def layout(nodes, edges, prev=None, iterations=ITERATIONS, budget_ms=BUDGET_MS):
     pos = {m: (xs[k], ys[k]) for k, m in enumerate(ids)}
 
     if len(common) >= 2:
+        return _align(pos, prev, common)
+    return _gauge(pos, ids)
+
+
+def _layout_c(ids, adj, idx, edges, prev, common):
+    """The firmware's C++ solver. Warm (a previous layout covers 2+ nodes):
+    start from it with no restarts, so a redraw is one cheap relaxation that
+    stops when converged. Only if that fits badly (the old shape was folded,
+    or the nodes moved a lot) is a fresh solve tried: classical MDS start plus
+    random restarts, all in C."""
+    n = len(ids)
+    ei, ej, ed = array("H"), array("H"), array("f")
+    for (a, b), d in edges.items():
+        if a != b and d is not None and a in idx and b in idx:
+            ei.append(idx[a])
+            ej.append(idx[b])
+            ed.append(d)
+    m = len(ed)
+    warm = len(common) >= 2
+    if warm:
+        start = _initial(ids, adj, prev)   # prev + new nodes by a neighbour; cheap
+        xs = array("f", [start[k][0] for k in ids])
+        ys = array("f", [start[k][1] for k in ids])
+        s = graphlayout.solve(xs, ys, ei, ej, ed, iterations=C_ITERATIONS, restarts=0)
+        if math.sqrt(s / m) > BAD_FIT:
+            xs2, ys2 = array("f", xs), array("f", ys)
+            s2 = graphlayout.solve(xs2, ys2, ei, ej, ed, iterations=C_ITERATIONS,
+                                   restarts=C_RESTARTS, margin=0.0, mds=True)
+            if s2 < s * (1 - RESTART_MARGIN):
+                xs, ys = xs2, ys2
+    else:
+        xs, ys = array("f", bytes(4 * n)), array("f", bytes(4 * n))
+        graphlayout.solve(xs, ys, ei, ej, ed, iterations=C_ITERATIONS,
+                          restarts=C_RESTARTS, margin=0.0, mds=True)
+    pos = {k: (xs[i], ys[i]) for i, k in enumerate(ids)}
+    if warm:
         return _align(pos, prev, common)
     return _gauge(pos, ids)
 

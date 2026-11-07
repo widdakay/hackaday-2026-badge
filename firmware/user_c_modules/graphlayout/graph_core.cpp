@@ -56,9 +56,12 @@ bool build(Graph &g, int n, int m, const uint16_t *ei, const uint16_t *ej, const
     return true;
 }
 
-// Gauss-Seidel sweeps of the localized SMACOF update.
-void relax(const Graph &g, float *x, float *y, int iterations) {
+// Gauss-Seidel sweeps of the localized SMACOF update. Stops early once no
+// node moves more than tol (converged). Returns the sweeps run.
+int relax(const Graph &g, float *x, float *y, int iterations) {
+    const float tol = 1e-4f * g.scale;
     for (int it = 0; it < iterations; it++) {
+        float moved = 0.0f;
         for (int i = 0; i < g.n; i++) {
             if (g.off[i] == g.off[i + 1]) continue;  // isolated
             float xi = x[i], yi = y[i], sx = 0.0f, sy = 0.0f;
@@ -73,9 +76,78 @@ void relax(const Graph &g, float *x, float *y, int iterations) {
                 sx += g.w[e] * (x[j] + f * dx);
                 sy += g.w[e] * (y[j] + f * dy);
             }
-            x[i] = sx * g.inv_wsum[i];
-            y[i] = sy * g.inv_wsum[i];
+            float nx = sx * g.inv_wsum[i], ny = sy * g.inv_wsum[i];
+            float m = std::fabs(nx - xi) + std::fabs(ny - yi);
+            if (m > moved) moved = m;
+            x[i] = nx;
+            y[i] = ny;
         }
+        if (moved < tol) return it + 1;
+    }
+    return iterations;
+}
+
+// Classical (Torgerson) MDS start: unmeasured pairs get shortest-path
+// distances, then the top two eigenvectors of the double-centred squared
+// distance matrix by power iteration. A good global start, so stress
+// majorization rarely folds.
+float g_D[kMaxNodes][kMaxNodes];
+
+void mds_init(const Graph &g, float *x, float *y) {
+    const int n = g.n;
+    const float inf = 1e30f;
+    for (int r = 0; r < n; r++)
+        for (int c = 0; c < n; c++) g_D[r][c] = r == c ? 0.0f : inf;
+    for (int i = 0; i < n; i++)
+        for (int e = g.off[i]; e < g.off[i + 1]; e++) g_D[i][g.nbr[e]] = g.len[e];
+    for (int k = 0; k < n; k++)                       // Floyd-Warshall
+        for (int r = 0; r < n; r++) {
+            float via = g_D[r][k];
+            if (via >= inf) continue;
+            for (int c = 0; c < n; c++)
+                if (via + g_D[k][c] < g_D[r][c]) g_D[r][c] = via + g_D[k][c];
+        }
+    float big = 1.0f;
+    for (int r = 0; r < n; r++)
+        for (int c = 0; c < n; c++)
+            if (g_D[r][c] < inf && g_D[r][c] > big) big = g_D[r][c];
+    big *= 1.5f;                                      // separate components
+    float rm[kMaxNodes], gm = 0.0f;
+    for (int r = 0; r < n; r++) {
+        float s = 0.0f;
+        for (int c = 0; c < n; c++) {
+            float d = g_D[r][c] < inf ? g_D[r][c] : big;
+            g_D[r][c] = d * d;                        // now squared distances
+            s += g_D[r][c];
+        }
+        rm[r] = s / n;
+        gm += rm[r];
+    }
+    gm /= n;
+    for (int r = 0; r < n; r++)                       // B = -1/2 J D^2 J
+        for (int c = 0; c < n; c++) g_D[r][c] = -0.5f * (g_D[r][c] - rm[r] - rm[c] + gm);
+
+    float *out[2] = {x, y};
+    for (int axis = 0; axis < 2; axis++) {
+        float v[kMaxNodes], w[kMaxNodes], lam = 0.0f;
+        for (int k = 0; k < n; k++) v[k] = ((k * 7 + axis * 3) % 11) - 5.0f + 0.1f * k;
+        for (int it = 0; it < 60; it++) {
+            float norm = 0.0f;
+            for (int r = 0; r < n; r++) {
+                float s = 0.0f;
+                for (int c = 0; c < n; c++) s += g_D[r][c] * v[c];
+                w[r] = s;
+                norm += s * s;
+            }
+            norm = std::sqrt(norm);
+            if (norm < 1e-12f) break;
+            for (int r = 0; r < n; r++) v[r] = w[r] / norm;
+            lam = norm;
+        }
+        float sc = std::sqrt(lam > 0.0f ? lam : 0.0f);
+        for (int r = 0; r < n; r++) out[axis][r] = v[r] * sc;
+        for (int r = 0; r < n; r++)                   // deflate
+            for (int c = 0; c < n; c++) g_D[r][c] -= lam * v[r] * v[c];
     }
 }
 
@@ -104,10 +176,12 @@ uint32_t next(uint32_t &state) {  // xorshift32
 
 extern "C" float graph_core_solve(int n, float *xs, float *ys,
                                   int m, const uint16_t *ei, const uint16_t *ej, const float *ed,
-                                  int iterations, int restarts, float margin, uint32_t seed) {
+                                  int iterations, int restarts, float margin, uint32_t seed,
+                                  int mds_start) {
     Graph &g = g_graph;
     if (!build(g, n, m, ei, ej, ed)) return -1.0f;
     if (n == 0) return 0.0f;
+    if (mds_start) mds_init(g, xs, ys);
 
     relax(g, xs, ys, iterations);
     float best = stress(g, xs, ys);
