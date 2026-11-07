@@ -23,8 +23,9 @@ subcarriers normalised so automatic gain and scaling drop out:
 Per FTM reading, from the CSI of the same pair (either direction) within
 +-WINDOW s:
   the means of the above, and
-  motion      1 - mean correlation of |H| between consecutive packets
-              (0 = static channel)
+  motion      mean relative change of normalised |H| between consecutive
+              packets, |a - b| / |a| (0 = static channel). Not a correlation:
+              on a flat LOS channel that measures mostly noise
   n_csi       packets used
 
 FTM error = dist_fine_cm / 100 - true_m - bias, where bias is the initiator's
@@ -144,11 +145,11 @@ def packet_features(rec, ltf):
 
 # ---- Joining ----------------------------------------------------------------
 def motion_of(amps):
-    """1 - mean Pearson correlation of consecutive |H| vectors (same length only)."""
-    cs = [np.corrcoef(a, b)[0, 1] for a, b in zip(amps, amps[1:])
-          if len(a) == len(b) and a.std() > 0 and b.std() > 0]
-    cs = [c for c in cs if np.isfinite(c)]
-    return 1 - float(np.mean(cs)) if cs else np.nan
+    """Mean relative change |a - b| / |a| of consecutive normalised |H| vectors
+    (same length only). On real C3s a static LOS link reads ~0.1 from noise."""
+    ds = [np.linalg.norm(a - b) / np.linalg.norm(a) for a, b in zip(amps, amps[1:])
+          if len(a) == len(b) and np.linalg.norm(a) > 0]
+    return float(np.mean(ds)) if ds else np.nan
 
 
 def join(ftm, csi, window, min_packets):
@@ -324,7 +325,7 @@ def motion_report(csi):
                 rows.append({"scene": w.scene.iloc[0], "motion": motion_of(list(w.amp))})
     m = pd.DataFrame(rows).dropna() if rows else pd.DataFrame(columns=["scene", "motion"])
     walking, still = m[m.scene.isin(WALKING_SCENES)], m[~m.scene.isin(WALKING_SCENES)]
-    print("\nMotion score in 2 s windows (1 - consecutive |H| correlation):")
+    print("\nMotion score in 2 s windows (relative change of |H| between packets):")
     if m.empty:
         print("  no windows with >= 4 packets")
         return None

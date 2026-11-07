@@ -76,6 +76,18 @@ def summarize(samples):
     return out
 
 
+def node_match(node, macs, names):
+    """Does the pair `macs` match --node? One node: any pair with it. Two
+    (comma separated): only the pair between them, either direction."""
+    if node is None:
+        return True
+    want = [n.strip().lower() for n in node.split(",") if n.strip()]
+    ids = [{m.lower(), names.get(m, "").lower()} for m in macs]
+    if len(want) == 1:
+        return any(want[0] in i for i in ids)
+    return len(ids) == 2 and ((want[0] in ids[0] and want[1] in ids[1]) or (want[0] in ids[1] and want[1] in ids[0]))
+
+
 def print_table(title, groups, names, true_m, node=None):
     print(f"\n{title}")
     print(f"  {'from':<12} -> {'to':<12} {'n':>4} {'ok%':>5} {'median':>7} {'mean':>6} {'std':>5} {'p10':>5} {'p90':>5}"
@@ -87,8 +99,7 @@ def print_table(title, groups, names, true_m, node=None):
         line = f"  {names.get(frm, frm[-8:]):<12} -> {names.get(to, to[-8:]):<12} {st['n']:>4} {st['ok_pct']:>4.0f}%"
         if st["ok"]:
             line += f" {st['median']:>6.2f}m {st['mean']:>5.2f}m {st['std']:>4.2f}m {st['p10']:>4.2f}m {st['p90']:>4.2f}m"
-            if true_m is not None and (node is None or node.lower() in
-                                       (frm, to, names.get(frm, "").lower(), names.get(to, "").lower())):
+            if true_m is not None and node_match(node, (frm, to), names):
                 line += f"   {st['median'] - true_m:+.2f}m"
         print(line)
 
@@ -131,7 +142,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", help="serial port (default: the only /dev/cu.usbmodem*)")
     ap.add_argument("--true-m", type=float, help="actual distance in meters, for calibration runs")
-    ap.add_argument("--node", help="only label pairs involving this node (name like node-D2F7AD, or AP MAC); "
+    ap.add_argument("--node", help="only label pairs involving this node (name like node-D2F7AD, or AP MAC), or "
+                                   "with two comma-separated nodes only the pair between them; "
                                    "other pairs are logged without a true distance")
     ap.add_argument("--csv", help="append every measurement to this CSV file")
     ap.add_argument("--csi", help="append every CSI packet to this JSON-lines file")
@@ -163,8 +175,7 @@ def main():
     buf = b""
 
     def labeled(macs):
-        return args.true_m is not None and (
-            args.node is None or any(args.node.lower() in (m, names.get(m, "").lower()) for m in macs))
+        return args.true_m is not None and node_match(args.node, macs, names)
 
     try:
         while args.duration is None or time.time() - start < args.duration:
@@ -208,7 +219,7 @@ def main():
                     csi_count += 1
                     if csi_out:
                         # "to" is the frame's destination (broadcast for ESP-NOW); "rx" is who received it.
-                        rec = {"time": round(now, 3), "rx": self_mac, "true_m": args.true_m if labeled((rec["from"], rec["to"])) else None,
+                        rec = {"time": round(now, 3), "rx": self_mac, "true_m": args.true_m if labeled((rec["from"], self_mac or rec["to"])) else None,
                                "scene": args.scene, **rec}
                         csi_out.write(json.dumps(rec, separators=(",", ":")) + "\n")
                 elif parts[0] == "CSI":

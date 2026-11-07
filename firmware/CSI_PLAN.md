@@ -11,6 +11,21 @@ from them the only CSI is from FTM frames (legacy OFDM, 6 Mbps) during this
 node's own ranging sessions. The HT-rate pings (phase 2) are what give CSI
 from ESP-NOW, so the most data comes when every node runs this firmware.
 
+Two C3s on this firmware, 0.5 m apart with a clear line of sight (`csi_data/`,
+untracked): FTM reads 0.35–0.44 m. HT pings arrive at about 8/s (20 % loss)
+and give 12.9 CSI packets/s per peer, 82 % HT. On this static link, |H|
+changes about 10 % from packet to packet, which is as much as the synthetic
+"walking" data. So:
+- the motion score is now relative change, not correlation, which on a
+  nearly flat LOS channel measures mostly noise. Its threshold comes from
+  real static data.
+- the CSI is small (median |H| 13 of 127 with the driver's automatic
+  scaling), so int8 rounding alone adds ~3 %. Try `manu_scale` with a
+  `shift` that brings it near full scale.
+- RSSI ranged −83 to −65 dBm over 60 s on this static link. Find out why
+  (people moving, antenna orientation) before reading much into amplitude
+  features.
+
 ## Why
 
 Ranging today (`badge/lib/ranging.py`, `ftm_node/`) works like this. Every
