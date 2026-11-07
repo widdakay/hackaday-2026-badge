@@ -101,6 +101,11 @@ KEEP_POWERED = False
 # passes of the latched table. update(fast=True, passes=1) trades contrast and
 # ghosting for speed; a later 3-pass refresh cleans the ghosts up.
 FAST_PASSES = 3
+# update(rows=N) limits the refresh window (0x90 DRFW) to the top N rows.
+# On at least one badge this left faint copies of the bar all the way down the
+# panel, so it is off: rows=N then runs a full-window differential refresh,
+# which only drives the pixels that changed (~1.2 s instead of ~0.1 s).
+PARTIAL_REFRESH_WINDOW = False
 # Close the session after this long without a refresh.
 KEEP_POWERED_IDLE_MS = 60_000
 # The reference tears the session down every 20 images regardless.
@@ -483,11 +488,13 @@ class EPaperDisplay:
     async def run(self):
         while True:
             if self._framebuffer_ready.is_set():
+                # Clear before refreshing, not after: an update() queued while
+                # this refresh runs must start a new request, not be dropped.
+                self._framebuffer_ready.clear()
                 await self.refresh_now(fast=self._fast_requested, passes=self._passes_requested,
                                        differential=self._diff_requested,
                                        flash=self._flash_requested,
                                        rows=self._partial_rows)
-                self._framebuffer_ready.clear()
             elif (
                 self._session_mode is not None
                 and time.ticks_diff(time.ticks_ms(), self._session_last_ms)
@@ -507,9 +514,9 @@ class EPaperDisplay:
         partial = rows is not None and 0 < rows < display_height
         if partial and self._driver_b and self._halves_valid:
             # Red elsewhere on the film doesn't matter: only the strip is driven.
-            await self._refresh_differential(False, rows)
+            await self._refresh_differential(False, rows if PARTIAL_REFRESH_WINDOW else None)
             return
-        if not partial:
+        if not partial or not PARTIAL_REFRESH_WINDOW:
             rows = None
         if differential and fast and self._driver_b and self._halves_valid and not self._red_on_panel:
             await self._refresh_differential(flash)

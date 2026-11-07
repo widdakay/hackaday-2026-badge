@@ -148,8 +148,12 @@ class AppSwitcher:
                     self.selecting_mode = True
                     self._bar_dirty_ms = time.ticks_ms()   # show the menu cursor
                     ## Reset pressed state so that button doesn't advance menu, just enters menu state
-                    MenuMinus._pressed_state = PRESSED_READ
-                    MenuPlus._pressed_state = PRESSED_READ
+                    MenuMinus.discard()
+                    MenuPlus.discard()
+                    # Presses latch until read; apps that ignore A/B would
+                    # otherwise leave one that instantly picks in the menu.
+                    UserA.discard()
+                    UserB.discard()
                     print("Activated app switching")
                     log.info(f"app leave {self.apps[self.active_idx].name}")
                 await self.apps[self.active_idx].arun()
