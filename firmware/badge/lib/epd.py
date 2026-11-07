@@ -32,7 +32,8 @@ import asyncio as aio
 import btree
 import framebuf
 import gc
-from machine import Pin, SoftSPI
+from machine import Pin, SPI, SoftSPI
+import micropython
 from micropython import const
 import time
 
@@ -74,6 +75,144 @@ def reverse_byte(byte: int) -> int:
     return byte
 
 
+# Hardware SPI for the whole bus. The old SoftSPI was bitbanged and nowhere near
+# its nominal 8 MHz. 4 MHz is the plane-transfer rate the iTC97 driver reference
+# validates; set USE_HW_SPI = False to fall back to SoftSPI if anything misbehaves.
+USE_HW_SPI = True
+EPD_SPI_BAUD = 4_000_000
+
+# Driver B (E2969JS0B1) only: the iTC97 reference (errata 9) says a B1 that never
+# receives 0x70 <- 71, 36 draws about 2 A during refresh. The original PDI port
+# never sent it, so it is off by default to keep the slow path unchanged.
+# Measure supply current before and after enabling it.
+B1_SEND_BOOSTER_CONFIG = False
+
+# Print a timed line for every refresh stage to the serial console.
+EPD_TIMING_LOG = True
+
+# Keep the panel's DC/DC booster running between refreshes ("kept-open session"
+# in the iTC97 reference). A later image in the same mode then costs only the
+# plane transfer and the trigger: no reset, no register sequence, no soft start,
+# no shutdown (about 2.5 s saved per update). Changeable at runtime through
+# display.keep_powered. Off by default: the booster's idle draw is unmeasured.
+KEEP_POWERED = False
+# Close the session after this long without a refresh.
+KEEP_POWERED_IDLE_MS = 60_000
+# The reference tears the session down every 20 images regardless.
+SESSION_MAX_IMAGES = 20
+
+# Lookup table replacing the per-byte reverse_byte() generator.
+_REVERSE_TABLE = bytes(reverse_byte(i) for i in range(256))
+
+
+@micropython.viper
+def _translate_inplace(buf: ptr8, n: int, table: ptr8):
+    i = 0
+    while i < n:
+        buf[i] = table[buf[i]]
+        i += 1
+
+
+@micropython.viper
+def _split_halves(src: ptr8, left: ptr8, right: ptr8):
+    """Split a full-width 1-bpp plane into the left and right COG halves.
+
+    Each 120-byte row gives its first 60 bytes to left and the rest to right.
+    Replaces 2688 Python slice copies per refresh, which took about 3.3 s.
+    """
+    hw = int(display_half_width_bytes)
+    fw = int(display_width_bytes)
+    row = 0
+    while row < int(display_height):
+        s = row * fw
+        d = row * hw
+        i = 0
+        while i < hw:
+            left[d + i] = src[s + i]
+            right[d + i] = src[s + hw + i]
+            i += 1
+        row += 1
+
+
+@micropython.viper
+def _any_set(buf: ptr8, n: int) -> int:
+    i = 0
+    while i < n:
+        if buf[i]:
+            return 1
+        i += 1
+    return 0
+
+
+@micropython.viper
+def _fold_red_into_black(black: ptr8, red: ptr8, n: int):
+    """Draw red as ink and clear the red plane (fast refresh is black/white)."""
+    i = 0
+    while i < n:
+        black[i] = black[i] | red[i]
+        red[i] = 0
+        i += 1
+
+
+@micropython.viper
+def _rgb565_to_planes(
+    src: ptr8, stride: int, w: int, h: int, x1: int, y1: int, black: ptr8, red: ptr8
+):
+    """Threshold an LVGL RGB565 area into the black and red 1-bpp planes.
+
+    Same thresholds as before: red if R high and G, B low; black if all low;
+    white otherwise. Top bits of R, G, B are bits 15, 10 and 4 of the pixel.
+    """
+    row = 0
+    while row < h:
+        base = (y1 + row) * display_width + x1
+        so = row * stride
+        col = 0
+        while col < w:
+            i = so + col * 2
+            c = src[i] | (src[i + 1] << 8)
+            idx = base + col
+            byte = idx >> 3
+            mask = 1 << (7 - (idx & 7))
+            clear = mask ^ 0xFF
+            r_hi = c & 0x8000
+            g_hi = c & 0x0400
+            b_hi = c & 0x0010
+            if r_hi and not g_hi and not b_hi:
+                red[byte] = red[byte] | mask
+                black[byte] = black[byte] & clear
+            elif not r_hi and not g_hi and not b_hi:
+                black[byte] = black[byte] | mask
+                red[byte] = red[byte] & clear
+            else:
+                black[byte] = black[byte] & clear
+                red[byte] = red[byte] & clear
+            col += 1
+        row += 1
+
+
+class _StageLog:
+    """Prints one line per refresh stage: time since start and stage duration."""
+
+    def __init__(self):
+        self.t0 = self.t = time.ticks_ms()
+
+    def mark(self, stage: str):
+        if not EPD_TIMING_LOG:
+            return
+        now = time.ticks_ms()
+        print(
+            "[epd t={:6d} ms] {:>6d} ms  {}".format(
+                time.ticks_diff(now, self.t0), time.ticks_diff(now, self.t), stage
+            )
+        )
+        self.t = now
+
+    def total(self):
+        if EPD_TIMING_LOG:
+            print("[epd] total {} ms".format(time.ticks_diff(time.ticks_ms(), self.t0)))
+
+
 class EPaperDisplay:
     width = display_width
     height = display_height
@@ -84,24 +223,51 @@ class EPaperDisplay:
         EPD_RST_PIN.value(True)
         EPD_CS1_PIN.value(True)
         EPD_CS2_PIN.value(True)
-        self.spi = SoftSPI(
-            baudrate=8_000_000, sck=EPD_SCL_PIN, mosi=EPD_SDA_PIN, miso=EPD_SPI_MISO_PIN
-        )
-        self.spi.init()
+        if USE_HW_SPI:
+            self.spi = SPI(
+                1,
+                baudrate=EPD_SPI_BAUD,
+                sck=EPD_SCL_PIN,
+                mosi=EPD_SDA_PIN,
+                miso=EPD_SPI_MISO_PIN,
+            )
+        else:
+            self.spi = SoftSPI(
+                baudrate=8_000_000,
+                sck=EPD_SCL_PIN,
+                mosi=EPD_SDA_PIN,
+                miso=EPD_SPI_MISO_PIN,
+            )
+            self.spi.init()
 
+        display_pn = b"B1"
         try:
             with open("/data/hwconf", "rb") as f:
                 hwconf = btree.open(f)
                 display_pn = hwconf.get(b"display_pn", b"B1")
-                if display_pn == b"84":
-                    self._reverse_fb_bits = False
-                else:
-                    self._reverse_fb_bits = True
         except OSError:
-            self._reverse_fb_bits = True
+            pass
+        # E2969JS084 has COG "driver 8", E2969JS0B1 has COG "driver B".
+        # They take different 0xB0 waveform formats (see data/rendered_luts.py).
+        self._driver_b = display_pn != b"84"
+        self._reverse_fb_bits = self._driver_b
 
         # The framebuffers are set and display should be updated.
         self._framebuffer_ready = aio.Event()
+        # Fast (short-waveform, black/white) refresh requested for the pending update.
+        self._fast_requested = False
+        # Red pigment may be on the film. A fast refresh cannot remove it, so the
+        # first fast refresh after red runs on the panel's own waveform instead.
+        # Unknown at boot, so assume yes.
+        self._red_on_panel = True
+        self._fast_lut = None
+        # Half-frame copies sent to the panel, allocated on first refresh.
+        self._halves = None
+        # Keep the COG booster running between refreshes (see KEEP_POWERED).
+        self.keep_powered = KEEP_POWERED
+        self._session_mode = None  # None = closed, else "fast" / "slow"
+        self._session_images = 0
+        self._session_last_ms = 0
 
         """Each byte is a mini-row of 8 bits for pixels of one color (1 sets the color, 0 is white)
         Bytes are in rows across the screen, as seen on the badge
@@ -150,33 +316,25 @@ class EPaperDisplay:
         except AttributeError:
             stride = w * 2
         src = color_p.__dereference__(stride * h)
-        width = display_width
-        for row in range(h):
-            base = (y1 + row) * width + x1
-            row_off = row * stride
-            for col in range(w):
-                i = row_off + col * 2
-                c = src[i] | (src[i + 1] << 8)  # RGB565, little-endian
-                r = (c >> 11) & 0x1F
-                g = (c >> 5) & 0x3F
-                b = c & 0x1F
-                idx = base + col
-                byte = idx >> 3
-                mask = 1 << (7 - (idx & 7))
-                clear = mask ^ 0xFF
-                if (r & 0x10) and not (g & 0x20) and not (b & 0x10):
-                    self._framebuffer_red[byte] |= mask
-                    self._framebuffer_black[byte] &= clear
-                elif not (r & 0x10) and not (g & 0x20) and not (b & 0x10):
-                    self._framebuffer_black[byte] |= mask
-                    self._framebuffer_red[byte] &= clear
-                else:
-                    self._framebuffer_black[byte] &= clear
-                    self._framebuffer_red[byte] &= clear
+        _rgb565_to_planes(
+            src, stride, w, h, x1, y1, self._framebuffer_black, self._framebuffer_red
+        )
         disp.flush_ready()
 
-    def update(self):
-        """Done updating the framebuffer, update the display with the contents"""
+    def update(self, fast: bool = False):
+        """Done updating the framebuffer, update the display with the contents
+
+        fast=True uses the short waveform from data/rendered_luts.py: about 3.3 s
+        of waveform instead of about 34-51 s, black and white only. Red in the
+        framebuffer is drawn as black. If red is still on the panel from an
+        earlier update, that refresh runs the slow waveform once to clear it.
+        If several updates are queued before the display picks them up, the
+        refresh is fast only if every one of them asked for fast.
+        """
+        if self._framebuffer_ready.is_set():
+            self._fast_requested = self._fast_requested and fast
+        else:
+            self._fast_requested = fast
         self._framebuffer_ready.set()
 
     def clear(self):
@@ -206,49 +364,36 @@ class EPaperDisplay:
         gc.collect()
 
     async def run(self):
-        black_left = bytearray(half_frame_one_color_size)
-        black_right = bytearray(half_frame_one_color_size)
-        red_left = bytearray(half_frame_one_color_size)
-        red_right = bytearray(half_frame_one_color_size)
         while True:
             if self._framebuffer_ready.is_set():
-                self._display_updated.clear()
-                fbk = memoryview(self._framebuffer_black)
-                fbr = memoryview(self._framebuffer_red)
-                for row in range(display_height):
-                    black_left[
-                        row * display_half_width_bytes : (row + 1)
-                        * display_half_width_bytes
-                    ] = fbk[
-                        row * display_width_bytes : row * display_width_bytes
-                        + display_half_width_bytes
-                    ]
-                    black_right[
-                        row * display_half_width_bytes : (row + 1)
-                        * display_half_width_bytes
-                    ] = fbk[
-                        row * display_width_bytes + display_half_width_bytes : (row + 1)
-                        * display_width_bytes
-                    ]
-                    red_left[
-                        row * display_half_width_bytes : (row + 1)
-                        * display_half_width_bytes
-                    ] = fbr[
-                        row * display_width_bytes : row * display_width_bytes
-                        + display_half_width_bytes
-                    ]
-                    red_right[
-                        row * display_half_width_bytes : (row + 1)
-                        * display_half_width_bytes
-                    ] = fbr[
-                        row * display_width_bytes + display_half_width_bytes : (row + 1)
-                        * display_width_bytes
-                    ]
-                await self.global_update(black_left, red_left, black_right, red_right)
+                await self.refresh_now(fast=self._fast_requested)
                 self._framebuffer_ready.clear()
-                gc.collect()
+            elif (
+                self._session_mode is not None
+                and time.ticks_diff(time.ticks_ms(), self._session_last_ms)
+                > KEEP_POWERED_IDLE_MS
+            ):
+                self._display_updated.clear()
+                await self.close_session(reason=f"idle {KEEP_POWERED_IDLE_MS} ms")
                 self._display_updated.set()
             await aio.sleep_ms(100)
+
+    async def refresh_now(self, fast: bool = False):
+        """Split the framebuffers into halves and refresh the panel once."""
+        if self._halves is None:
+            self._halves = [bytearray(half_frame_one_color_size) for _ in range(4)]
+        black_left, black_right, red_left, red_right = self._halves
+        self._display_updated.clear()
+        log = _StageLog()
+        _split_halves(self._framebuffer_black, black_left, black_right)
+        _split_halves(self._framebuffer_red, red_left, red_right)
+        log.mark("split framebuffers into halves")
+        await self.global_update(
+            black_left, red_left, black_right, red_right, fast=fast, log=log
+        )
+        gc.collect()
+        self._display_updated.set()
+        log.total()
 
     async def global_update(
         self,
@@ -256,23 +401,123 @@ class EPaperDisplay:
         red_left: bytearray | bytes | memoryview[int],
         black_right: bytearray | bytes | memoryview[int],
         red_right: bytearray | bytes | memoryview[int],
+        fast: bool = False,
+        log=None,
     ):
-        print("Updating display to new image")
+        """Push both halves to the panel and refresh.
+
+        The half-frame buffers are modified in place (bit reversal, red folding),
+        so pass copies, as run() does.
+        """
+        if log is None:
+            log = _StageLog()
+        n = half_frame_one_color_size
+        has_red = _any_set(red_left, n) or _any_set(red_right, n)
+        use_lut = fast
+        if fast:
+            # Fast refresh is black/white: red is drawn as ink, never dropped.
+            if has_red:
+                _fold_red_into_black(black_left, red_left, n)
+                _fold_red_into_black(black_right, red_right, n)
+            # A short waveform cannot lift red already on the film. Promote this
+            # one refresh to the panel's own waveform; red stays suppressed.
+            if self._red_on_panel:
+                print("Fast refresh requested but red may be on the panel; using slow waveform once")
+                use_lut = False
+        drew_red = has_red and not fast
+        log.mark(f"scan red (has_red={has_red}, folded={fast and has_red})")
+
+        mode = "fast" if use_lut else "slow"
+        print(f"Updating display to new image ({mode}, driver {'B' if self._driver_b else '8'})")
+
+        # Kept-open session: the panel latches one waveform per session, so a
+        # mode change has to close it first (rewriting 0xB0 in an open session
+        # drops the panel back to its own waveform rather than re-latching).
+        if self._session_mode is not None:
+            if not self.keep_powered:
+                await self.close_session(log, "keep_powered turned off")
+            elif self._session_mode != mode:
+                await self.close_session(log, f"mode change {self._session_mode} -> {mode}")
+            elif self._session_images >= SESSION_MAX_IMAGES:
+                await self.close_session(log, f"{SESSION_MAX_IMAGES} images in session")
+
+        if self._session_mode == mode:
+            # Warm: booster is still up and the waveform is still latched.
+            self._send_images(black_left, red_left, black_right, red_right, log)
+            await self._trigger(use_lut, log)
+            self._session_images += 1
+            self._session_last_ms = time.ticks_ms()
+            self._red_on_panel = drew_red
+            log.mark(f"session kept open ({self._session_images} images)")
+            return
+
         await self._reset()
-        tick = time.ticks_ms()
-        self._send_images(black_left, red_left, black_right, red_right)
-        tock = time.ticks_ms()
-        print(tock-tick)
-        
-        print("display working")
-        tick = time.ticks_ms()
+        log.mark("hard reset")
+        if self._driver_b and B1_SEND_BOOSTER_CONFIG:
+            self._send_index_data(0x70, [0x71, 0x36])  # booster config, both COGs
+        self._send_images(black_left, red_left, black_right, red_right, log)
+
         await self.cog_initial()
+        log.mark("COG init register sequence")
+        if use_lut:
+            # The only window for 0xB0: after the last waveform-load strobe in
+            # cog_initial (which loads the OTP waveform into these registers) and
+            # before the DC/DC soft start. Both CS low, so both COGs latch it.
+            lut = self._get_fast_lut()
+            self._send_index_data(0xB0, lut)
+            log.mark(f"write 0xB0 waveform ({len(lut)} B)")
         await self._dcdc_soft_start()
-        await self._display_refresh()
+        log.mark("DC/DC soft start")
+        await self._trigger(use_lut, log)
+        self._red_on_panel = drew_red
+        if self.keep_powered:
+            self._session_mode = mode
+            self._session_images = 1
+            self._session_last_ms = time.ticks_ms()
+            log.mark("session left open (booster on)")
+        else:
+            await self._dcdc_soft_shutdown()
+            log.mark("DC/DC soft shutdown")
+
+    async def _trigger(self, use_lut: bool, log):
+        if use_lut and self._driver_b:
+            # Driver B runs a fixed ~1070 ms window per trigger whatever the table
+            # length, so the dose is delivered as three pulls of the latched table.
+            for pull in range(3):
+                await self._display_refresh(log, f"pull {pull + 1}/3: ")
+        else:
+            await self._display_refresh(log)
+
+    async def close_session(self, log=None, reason: str = ""):
+        """Shut the booster down if a kept-open session is running."""
+        if self._session_mode is None:
+            return
+        print(f"Closing EPD session ({reason})")
         await self._dcdc_soft_shutdown()
-        print("Done updating display")
-        tock = time.ticks_ms()
-        print(tock-tick)
+        self._session_mode = None
+        self._session_images = 0
+        if log:
+            log.mark("DC/DC soft shutdown (session closed)")
+
+    def _get_fast_lut(self) -> bytes:
+        """The short waveform for this COG revision, loaded on first use."""
+        if self._fast_lut is None:
+            from data import rendered_luts
+
+            if self._driver_b:
+                lut = rendered_luts.lutb_base
+                expected = 400
+            else:
+                # Base table: no red in this frame or the last. Red frames never
+                # take the fast path, so the red variants are not needed here.
+                lut = rendered_luts.lut8_nored_noclear
+                expected = 180
+            if len(lut) != expected:
+                raise ValueError(f"0xB0 table is {len(lut)} bytes, expected {expected}")
+            self._fast_lut = bytes(lut)
+            del rendered_luts
+            gc.collect()
+        return self._fast_lut
 
 
     async def cog_initial(self):
@@ -333,7 +578,15 @@ class EPaperDisplay:
         await aio.sleep_ms(150)
         EPD_RST_PIN.value(False)
 
+    @staticmethod
+    def _as_buffer(data):
+        # Avoid copying the 40 KB planes; only lists need converting.
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            return data
+        return bytes(data)
+
     def _send_index_data(self, index: int, data: bytes | list):
+        data = self._as_buffer(data)
         EPD_DC_PIN.value(False)
         EPD_CS1_PIN.value(False)
         EPD_CS2_PIN.value(False)
@@ -343,11 +596,12 @@ class EPaperDisplay:
         EPD_DC_PIN.value(True)
         EPD_CS1_PIN.value(False)
         EPD_CS2_PIN.value(False)
-        self.spi.write(bytes(data))
+        self.spi.write(data)
         EPD_CS1_PIN.value(True)
         EPD_CS2_PIN.value(True)
 
     def _send_index_data_left(self, index: int, data: bytes | list | memoryview[int]):
+        data = self._as_buffer(data)
         EPD_DC_PIN.value(False)
         EPD_CS1_PIN.value(False)
         EPD_CS2_PIN.value(True)
@@ -355,10 +609,11 @@ class EPaperDisplay:
         EPD_CS1_PIN.value(True)
         EPD_DC_PIN.value(True)
         EPD_CS1_PIN.value(False)
-        self.spi.write(bytes(data))
+        self.spi.write(data)
         EPD_CS1_PIN.value(True)
 
     def _send_index_data_right(self, index: int, data: bytes | list | memoryview[int]):
+        data = self._as_buffer(data)
         EPD_DC_PIN.value(False)
         EPD_CS1_PIN.value(True)
         EPD_CS2_PIN.value(False)
@@ -366,14 +621,34 @@ class EPaperDisplay:
         EPD_CS2_PIN.value(True)
         EPD_DC_PIN.value(True)
         EPD_CS2_PIN.value(False)
-        self.spi.write(bytes(data))
+        self.spi.write(data)
         EPD_CS2_PIN.value(True)
 
-    async def _display_refresh(self):
+    async def _display_refresh(self, log=None, label: str = ""):
+        """Wait for the booster to be ready, trigger an update, and wait for it to finish.
+
+        Waiting for BUSY to drop after 0x15 matters when triggers are chained
+        (driver B pulls the fast table three times): without it the next
+        trigger, or the shutdown, could see BUSY still high and go early.
+        """
         while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
-            await aio.sleep_ms(100)
+            await aio.sleep_ms(10)
+        if log:
+            log.mark(label + "wait BUSY ready")
         self._send_index_data(0x15, [0x3C])
-        await aio.sleep_ms(5)
+        start = time.ticks_ms()
+        while EPD_BUSY1_PIN.value() and EPD_BUSY2_PIN.value():
+            if time.ticks_diff(time.ticks_ms(), start) > 2000:
+                print("BUSY never dropped after 0x15")
+                break
+            await aio.sleep_ms(5)
+        if log:
+            log.mark(label + "0x15 trigger until BUSY low")
+        # Waveform runs while BUSY is low. Poll finely so the timing is accurate.
+        while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
+            await aio.sleep_ms(10)
+        if log:
+            log.mark(label + "waveform (BUSY low)")
 
     async def _reset(self):
         """CoG driver power-on hard reset"""
@@ -394,6 +669,7 @@ class EPaperDisplay:
         red_left: bytearray | bytes | memoryview[int],
         black_right: bytearray | bytes | memoryview[int],
         red_right: bytearray | bytes | memoryview[int],
+        log=None,
     ):
         assert len(black_left) == half_frame_one_color_size
         assert len(red_left) == half_frame_one_color_size
@@ -401,10 +677,16 @@ class EPaperDisplay:
         assert len(red_right) == half_frame_one_color_size
 
         if self._reverse_fb_bits:
-            black_left = bytes(reverse_byte(b) for b in black_left)
-            red_left = bytes(reverse_byte(b) for b in red_left)
-            black_right = bytes(reverse_byte(b) for b in black_right)
-            red_right = bytes(reverse_byte(b) for b in red_right)
+            n = half_frame_one_color_size
+            planes = []
+            for plane in (black_left, red_left, black_right, red_right):
+                if not isinstance(plane, bytearray):
+                    plane = bytearray(plane)
+                _translate_inplace(plane, n, _REVERSE_TABLE)
+                planes.append(plane)
+            black_left, red_left, black_right, red_right = planes
+            if log:
+                log.mark("bit-reverse 4 planes")
 
         # DUW for both left and right halves
         self._send_index_data(0x13, [0x00, 0x3B, 0x00, 0x00, 0x9F, 0x02])
@@ -419,6 +701,8 @@ class EPaperDisplay:
         self._send_index_data_right(0x10, black_right)  # black frame for right half
         self._send_index_data_right(0x12, ram_rw_data)  # RAM_RW for right half
         self._send_index_data_right(0x11, red_right)  # Red frame for right half
+        if log:
+            log.mark(f"SPI send 4 planes ({4 * half_frame_one_color_size} B)")
 
 
     async def _dcdc_soft_start(self):
