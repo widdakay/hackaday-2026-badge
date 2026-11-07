@@ -1,9 +1,18 @@
 # Plan: Wi-Fi CSI to improve FTM ranging
 
-Status (2026-11-07): phases 1–4 built. Firmware builds for C3 and S3 and
-runs on a C3. The logger and analysis tools are tested on that board's
-output and on synthetic data. Next: collect the labelled data (phase 3,
-step 2), then run `tools/csi_analysis.py`. Phase 5 waits for its go/no-go.
+Status (2026-11-07):
+
+| Phase | State |
+|---|---|
+| 1. CSI capture on `ftm_node` | done; builds for C3 and S3, runs on two C3s |
+| 2. HT-rate pings | done and checked on hardware (12.9 CSI pkt/s per peer, 82 % HT); AGC compensation not done |
+| 3. Logging and labels | tools done (`--csi`, `--scene`, `--node A,B`); data: one 60 s `los` run at 0.5 m |
+| 4. Offline analysis | `tools/csi_analysis.py` done, tested on synthetic data and that run; no verdict yet (one scene only) |
+| 5. Badge | not started; waits for the phase 4 go/no-go |
+
+Next: record the rest of the phase 3 runs (more distances, `person`/`body`,
+`walking-people`) with the same pair, then run `tools/csi_analysis.py`.
+Raw data stays out of git (`firmware/ftm_node/csi_data/`, local).
 
 First hardware finding: only OFDM packets carry CSI. Badges and older nodes
 send ESP-NOW at 1 Mbps 802.11b (DSSS), which has no OFDM training field, so
