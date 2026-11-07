@@ -4,3 +4,5 @@ CONFIG_ESP_WIFI_FTM_INITIATOR_SUPPORT=y
 CONFIG_ESP_WIFI_FTM_RESPONDER_SUPPORT=y
 # ESP32-C3 SuperMini: console on the native USB port
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Channel state information capture (firmware/CSI_PLAN.md)
+CONFIG_ESP_WIFI_CSI_ENABLED=y

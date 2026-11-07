@@ -53,3 +53,34 @@ One record per line, comma separated. See the comment at the top of
   driver's average without the rounding. Clamping biases it upward at short
   range (around 1 m).
 - One-way distance in cm = `rtt_mean_ps * 0.0149896`.
+
+## CSI (channel state information)
+
+Experimental, see `firmware/CSI_PLAN.md`. With `kCsiEnabled` (on by default in
+`main/main.cpp`) the node prints a `CSI` line for packets it receives from
+known peers, with the raw per-subcarrier channel, rate-limited to
+`kCsiMaxHzPerPeer` per peer and packet kind, plus a `CSISTAT` line every 10 s.
+It also broadcasts a small ESP-NOW `PING` (type 5) `kPingHz` times a second,
+at HT20 MCS0 (`kEspnowHtRate`), so other nodes get frequent CSI that
+includes the HT-LTF field.
+
+Only OFDM packets carry CSI. Badges and older nodes send ESP-NOW at 1 Mbps
+802.11b, which has no OFDM training field, so from those peers CSI comes only
+from the FTM frames of this node's own ranging sessions (`kind` = `ftm`).
+
+Record labelled runs (one per distance and scene):
+
+```sh
+uv run --with pyserial firmware/ftm_node/tools/ftm_monitor.py --true-m 3.0 --scene body \
+    --csv csi_cal.csv --csi csi_cal.jsonl --duration 60
+```
+
+Scenes: `los`, `body` (wearer's back to the other node), `person` (someone
+between), `crowd`, `wall`, `walking-node`, `walking-people`. Then:
+
+```sh
+uv run --with numpy,pandas firmware/ftm_node/tools/csi_analysis.py --csv csi_cal.csv --csi csi_cal.jsonl
+```
+
+It prints whether CSI predicts NLOS, FTM error or motion well enough to be
+worth putting on the badge (the plan's go/no-go).

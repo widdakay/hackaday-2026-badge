@@ -20,6 +20,19 @@
 //        measured by this node (from == SELF)
 //   RDIST,...same fields...
 //        measured by another node, received over ESP-NOW
+//   CSI,<from>,<to>,<t_us>,<rssi>,<noise_floor>,<sig_mode>,<rate_or_mcs>,<cwb>,<stbc>,
+//       <first_word_invalid>,<kind>,<seq>,<len>,<csi_base64>
+//        channel state of one packet received from a peer (only when kCsiEnabled).
+//        to is this node (or ff:ff:.. for broadcasts), t_us is the radio's receive
+//        timestamp. kind is beacon, range, ping, ftm or other (what the packet
+//        was); seq is the beacon/ping sequence number, empty otherwise. The
+//        CSI bytes are int8 (imaginary, real) pairs per subcarrier, as the
+//        driver gives them: on HT20, 128 bytes of LLTF (subcarriers 0..31 then
+//        -32..-1), followed for HT packets by 128 bytes of HT-LTF in the same
+//        order (and 128 more of STBC HT-LTF2 for STBC packets).
+//   CSISTAT,<seen>,<queue_drops>,<throttled>,<printed>
+//        every 10 s, counts since boot: CSI callbacks from known peers, dropped
+//        because the queue was full, skipped by the per-peer rate limit, printed
 //
 // dist_cm, rtt_raw_ns and rtt_est_ns come from the Wi-Fi driver and are whole
 // nanoseconds of round trip (15 cm steps). The *_ps fields are computed here
@@ -28,6 +41,7 @@
 // is the useful one: the driver's average without its rounding.
 // One-way distance = rtt_ps * 0.1499 mm.
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -57,6 +71,14 @@ constexpr uint32_t kBeaconPeriodMs = 1000;
 constexpr uint32_t kSessionTimeoutMs = 1000; // a session takes ~100-300 ms; give up on a busy peer fast
 constexpr int64_t kPeerTimeoutMs = 10000;
 constexpr int kMaxPeers = 24;
+
+// CSI capture (firmware/CSI_PLAN.md). Needs CONFIG_ESP_WIFI_CSI_ENABLED.
+constexpr bool kCsiEnabled = true;
+constexpr uint32_t kCsiMaxHzPerPeer = 20;   // per peer and packet kind; USB serial carries ~100 kB/s
+constexpr bool kCsiFtmFrames = true;        // also capture CSI of FTM frames, not only ESP-NOW
+constexpr uint32_t kPingHz = 10;            // ESP-NOW ping broadcast rate, 0 = off; only sent with kCsiEnabled
+constexpr bool kEspnowHtRate = true;        // send ESP-NOW at HT20 MCS0, so CSI includes the HT-LTF.
+                                            // Turn off if far nodes are lost: MCS0 needs a few dB more SNR
 #if CONFIG_IDF_TARGET_ESP32C3
 constexpr gpio_num_t kLed = GPIO_NUM_8;     // SuperMini blue LED, active low
 constexpr bool kLedActiveLow = true;
@@ -69,7 +91,7 @@ constexpr bool kLedActiveLow = false;
 constexpr char kMagic[4] = {'B', 'B', 'F', 'T'};
 constexpr uint8_t kProtoVersion = 2;
 constexpr int kMaxReportEntries = 64;
-enum : uint8_t { kMsgBeacon = 1, kMsgRange = 2 };
+enum : uint8_t { kMsgBeacon = 1, kMsgRange = 2, kMsgPing = 5 };  // 3, 4: badge NAMES, SYNC
 
 struct __attribute__((packed)) Header {
     char magic[4];
@@ -81,6 +103,13 @@ struct __attribute__((packed)) BeaconMsg {
     Header hdr;
     uint32_t seq;
     char name[16];
+};
+
+// Sent kPingHz times a second only to give the other nodes packets to take CSI
+// from. Receivers ignore it, apart from the CSI.
+struct __attribute__((packed)) PingMsg {
+    Header hdr;
+    uint32_t seq;
 };
 
 struct __attribute__((packed)) Range {
@@ -118,6 +147,29 @@ struct RxPacket {
     uint8_t data[64];
 };
 
+// One CSI packet as copied out of the Wi-Fi task's callback.
+enum : uint8_t { kCsiBeacon, kCsiRange, kCsiPing, kCsiFtm, kCsiOther, kCsiKinds };
+const char *const kCsiKindNames[kCsiKinds] = {"beacon", "range", "ping", "ftm", "other"};
+constexpr int kCsiMaxLen = 384;     // LLTF + HT-LTF + STBC HT-LTF2 on HT20
+
+struct CsiPacket {
+    uint8_t src[6];
+    uint8_t dst[6];
+    uint32_t t_us;
+    int8_t rssi;
+    int8_t noise_floor;
+    uint8_t sig_mode;
+    uint8_t rate;           // rx_ctrl.rate for non-HT, rx_ctrl.mcs for HT
+    uint8_t cwb;
+    uint8_t stbc;
+    bool first_word_invalid;
+    uint8_t kind;
+    bool has_seq;
+    uint32_t seq;
+    uint16_t len;
+    int8_t buf[kCsiMaxLen];
+};
+
 constexpr EventBits_t kFtmDone = BIT0;
 constexpr EventBits_t kPeerNew = BIT1;   // a node was heard for the first time
 const uint8_t kBroadcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
@@ -129,6 +181,9 @@ Peer g_peers[kMaxPeers];
 wifi_event_ftm_report_t g_report;
 uint8_t g_self[6];
 char g_name[17];
+
+QueueHandle_t g_csi_queue;
+std::atomic<uint32_t> g_csi_seen{0}, g_csi_queue_drops{0};
 
 int64_t now_ms() { return esp_timer_get_time() / 1000; }
 
@@ -207,6 +262,68 @@ void on_espnow_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
     pkt.len = len;
     std::memcpy(pkt.data, data, len);
     xQueueSend(g_rx_queue, &pkt, 0);  // drop if full
+}
+
+// What a received frame was, from its body: one of our ESP-NOW messages
+// (found by its magic in the vendor element), an FTM frame (public action,
+// category 4, action 33), or something else.
+uint8_t csi_kind(const wifi_csi_info_t *info, bool *has_seq, uint32_t *seq) {
+    *has_seq = false;
+    const uint8_t *p = info->payload;
+    int n = p ? info->payload_len : 0;
+    for (int i = 0; i + static_cast<int>(sizeof(Header)) <= n && i < 48; i++) {
+        if (std::memcmp(p + i, kMagic, sizeof(kMagic)) != 0) continue;
+        const auto *h = reinterpret_cast<const Header *>(p + i);
+        if (h->type == kMsgBeacon || h->type == kMsgPing) {
+            if (i + static_cast<int>(sizeof(Header) + 4) <= n) {
+                std::memcpy(seq, p + i + sizeof(Header), 4);
+                *has_seq = true;
+            }
+            return h->type == kMsgBeacon ? kCsiBeacon : kCsiPing;
+        }
+        return h->type == kMsgRange ? kCsiRange : kCsiOther;
+    }
+    // The payload may or may not include the 24-byte MAC header; try both.
+    for (int off : {0, 24}) {
+        if (off + 2 <= n && p[off] == 4 && p[off + 1] == 33) return kCsiFtm;
+    }
+    return kCsiOther;
+}
+
+bool is_peer(const uint8_t *mac) {
+    // Unlocked: a torn read while peer_heard writes a slot only drops or keeps
+    // one packet wrongly, and taking a mutex in the Wi-Fi task isn't allowed.
+    for (const auto &p : g_peers) {
+        if (p.used && std::memcmp(p.mac, mac, 6) == 0) return true;
+    }
+    return false;
+}
+
+void on_csi(void *, wifi_csi_info_t *info) {
+    if (!info || !info->buf || !is_peer(info->mac)) return;
+    g_csi_seen.fetch_add(1, std::memory_order_relaxed);
+    bool has_seq;
+    uint32_t seq = 0;
+    uint8_t kind = csi_kind(info, &has_seq, &seq);
+    if (kind == kCsiFtm && !kCsiFtmFrames) return;
+    static CsiPacket pkt;  // only the Wi-Fi task runs this; too big for its stack
+    std::memcpy(pkt.src, info->mac, 6);
+    std::memcpy(pkt.dst, info->dmac, 6);
+    const wifi_pkt_rx_ctrl_t &rx = info->rx_ctrl;
+    pkt.t_us = rx.timestamp;
+    pkt.rssi = rx.rssi;
+    pkt.noise_floor = rx.noise_floor;
+    pkt.sig_mode = rx.sig_mode;
+    pkt.rate = rx.sig_mode ? rx.mcs : rx.rate;
+    pkt.cwb = rx.cwb;
+    pkt.stbc = rx.stbc;
+    pkt.first_word_invalid = info->first_word_invalid;
+    pkt.kind = kind;
+    pkt.has_seq = has_seq;
+    pkt.seq = seq;
+    pkt.len = std::min<int>(info->len, kCsiMaxLen);
+    std::memcpy(pkt.buf, info->buf, pkt.len);
+    if (xQueueSend(g_csi_queue, &pkt, 0) != pdTRUE) g_csi_queue_drops.fetch_add(1, std::memory_order_relaxed);
 }
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
@@ -313,6 +430,90 @@ void beacon_task(void *) {
     }
 }
 
+// Base64 of `n` bytes into `out` (4 * ceil(n / 3) + 1 bytes). Returns its length.
+int base64(const uint8_t *in, int n, char *out) {
+    static const char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int o = 0;
+    for (int i = 0; i < n; i += 3) {
+        uint32_t v = in[i] << 16 | (i + 1 < n ? in[i + 1] << 8 : 0) | (i + 2 < n ? in[i + 2] : 0);
+        out[o++] = kAlphabet[v >> 18 & 63];
+        out[o++] = kAlphabet[v >> 12 & 63];
+        out[o++] = i + 1 < n ? kAlphabet[v >> 6 & 63] : '=';
+        out[o++] = i + 2 < n ? kAlphabet[v & 63] : '=';
+    }
+    out[o] = '\0';
+    return o;
+}
+
+// Prints the CSI packets the callback queued, at most kCsiMaxHzPerPeer per
+// peer and packet kind, and a CSISTAT line every 10 s.
+void csi_task(void *) {
+    struct Last {
+        uint8_t mac[6];
+        int64_t us[kCsiKinds];
+    };
+    static Last last[kMaxPeers];
+    static int used = 0;
+    static CsiPacket pkt;
+    static char b64[4 * ((kCsiMaxLen + 2) / 3) + 1];
+    const int64_t min_gap_us = 1000000 / kCsiMaxHzPerPeer;
+    uint32_t throttled = 0, printed = 0;
+    int64_t next_stat = esp_timer_get_time() + 10000000;
+    while (true) {
+        if (xQueueReceive(g_csi_queue, &pkt, pdMS_TO_TICKS(1000))) {
+            int64_t t = esp_timer_get_time();
+            Last *l = nullptr;
+            for (int i = 0; i < used; i++) {
+                if (std::memcmp(last[i].mac, pkt.src, 6) == 0) { l = &last[i]; break; }
+            }
+            if (!l) {
+                // Table full: reuse the slot with the oldest packet.
+                if (used < kMaxPeers) {
+                    l = &last[used++];
+                } else {
+                    l = &last[0];
+                    for (int i = 1; i < used; i++) {
+                        if (*std::max_element(last[i].us, last[i].us + kCsiKinds) <
+                            *std::max_element(l->us, l->us + kCsiKinds)) l = &last[i];
+                    }
+                }
+                std::memcpy(l->mac, pkt.src, 6);
+                std::fill(l->us, l->us + kCsiKinds, INT64_MIN / 2);
+            }
+            if (t - l->us[pkt.kind] < min_gap_us) {
+                throttled++;
+            } else {
+                l->us[pkt.kind] = t;
+                base64(reinterpret_cast<const uint8_t *>(pkt.buf), pkt.len, b64);
+                char seq[11] = "";
+                if (pkt.has_seq) snprintf(seq, sizeof(seq), "%" PRIu32, pkt.seq);
+                printf("CSI," MACSTR "," MACSTR ",%" PRIu32 ",%d,%d,%u,%u,%u,%u,%d,%s,%s,%u,%s\n",
+                       MAC2STR(pkt.src), MAC2STR(pkt.dst), pkt.t_us, pkt.rssi, pkt.noise_floor, pkt.sig_mode,
+                       pkt.rate, pkt.cwb, pkt.stbc, pkt.first_word_invalid ? 1 : 0, kCsiKindNames[pkt.kind], seq,
+                       pkt.len, b64);
+                printed++;
+            }
+        }
+        if (esp_timer_get_time() >= next_stat) {
+            next_stat += 10000000;
+            printf("CSISTAT,%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", g_csi_seen.load(),
+                   g_csi_queue_drops.load(), throttled, printed);
+        }
+    }
+}
+
+void ping_task(void *) {
+    PingMsg msg = {};
+    fill_header(msg.hdr, kMsgPing);
+    TickType_t wake = xTaskGetTickCount();
+    const TickType_t period = std::max<TickType_t>(1, pdMS_TO_TICKS(1000 / kPingHz));
+    while (true) {
+        msg.seq++;
+        esp_now_send(kBroadcast, reinterpret_cast<const uint8_t *>(&msg), sizeof(msg));
+        vTaskDelayUntil(&wake, period);
+    }
+}
+
 // One FTM session with `peer`. Returns false if it could not be started.
 bool range_one(const uint8_t *peer) {
     wifi_ftm_initiator_cfg_t cfg = {};
@@ -415,6 +616,29 @@ void start_radio() {
     bcast.ifidx = WIFI_IF_AP;
     bcast.encrypt = false;
     ESP_ERROR_CHECK(esp_now_add_peer(&bcast));
+
+    if (kEspnowHtRate) {
+        esp_now_rate_config_t rate = {};
+        rate.phymode = WIFI_PHY_MODE_HT20;
+        rate.rate = WIFI_PHY_RATE_MCS0_LGI;
+        esp_err_t err = esp_now_set_peer_rate_config(kBroadcast, &rate);
+        if (err != ESP_OK) printf("ERR,espnow_rate,%s\n", esp_err_to_name(err));
+    }
+
+    if (kCsiEnabled) {
+        wifi_csi_config_t csi = {};
+        csi.lltf_en = true;
+        csi.htltf_en = true;
+        csi.stbc_htltf2_en = true;
+        csi.ltf_merge_en = false;       // keep LLTF and HT-LTF separate, as measured
+        csi.channel_filter_en = false;  // no smoothing across subcarriers
+        csi.manu_scale = false;
+        csi.shift = 0;
+        csi.dump_ack_en = false;
+        ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi));
+        ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(on_csi, nullptr));
+        ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+    }
 }
 
 }  // namespace
@@ -441,6 +665,7 @@ extern "C" void app_main() {
     g_events = xEventGroupCreate();
     g_rx_queue = xQueueCreate(32, sizeof(RxPacket));
     g_peers_lock = xSemaphoreCreateMutex();
+    if (kCsiEnabled) g_csi_queue = xQueueCreate(16, sizeof(CsiPacket));
 
     start_radio();
     printf("SELF," MACSTR ",%s,%d\n", MAC2STR(g_self), g_name, kChannel);
@@ -448,4 +673,9 @@ extern "C" void app_main() {
     xTaskCreate(rx_task, "ftm_rx", 4096, nullptr, 5, nullptr);
     xTaskCreate(beacon_task, "ftm_beacon", 3072, nullptr, 4, nullptr);
     xTaskCreate(range_task, "ftm_range", 4096, nullptr, 4, nullptr);
+    if (kCsiEnabled) {
+        // Below ranging: printing CSI must never delay a session.
+        xTaskCreate(csi_task, "ftm_csi", 4096, nullptr, 3, nullptr);
+        if (kPingHz) xTaskCreate(ping_task, "ftm_ping", 2048, nullptr, 4, nullptr);
+    }
 }
