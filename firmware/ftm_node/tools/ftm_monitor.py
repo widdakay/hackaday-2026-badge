@@ -220,6 +220,10 @@ def main():
                               f"{throttled} rate-limited, {printed} printed")
                 elif parts[0] == "ERR":
                     print(f"  board error: {line}")
+                elif parts[0] in ("DIST", "RDIST") and len(parts) >= 4 and parts[3] in ("timeout", "start_err"):
+                    # Short failure lines from range_one(): count them, nothing to log.
+                    recent[(parts[1], parts[2])].append((now, parts[3], None))
+                    everything[(parts[1], parts[2])].append((parts[3], None))
                 elif parts[0] in ("DIST", "RDIST"):
                     print(f"  unexpected line (old firmware?): {line}")
                 elif line.startswith(("E (", "abort", "Guru", "assert")):
