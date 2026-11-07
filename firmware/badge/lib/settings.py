@@ -2,8 +2,10 @@
 
     {"name": "Kaveh"}
 
-`name` is shown on the nametag (scripts/make_nametag.py reads the same file)
-and broadcast by the ranging service, at most 16 bytes.
+`name` is drawn on the nametags (lib/name_render.py) and broadcast by the
+ranging service, at most 16 bytes. Edit the file on the badge and reset: no
+firmware rebuild needed. Without a name, both use badge-XXXXXX from the MAC.
+Optional: "initiator_bias_m", see lib/ranging.py.
 """
 
 import json
@@ -32,3 +34,13 @@ def badge_name(default):
         except UnicodeError:
             raw = raw[:-1]
     return default
+
+
+def default_name():
+    """badge-XXXXXX from the last three bytes of the Wi-Fi AP MAC."""
+    try:
+        import network
+        mac = network.WLAN(network.AP_IF).config("mac")
+        return "badge-%02X%02X%02X" % (mac[3], mac[4], mac[5])
+    except Exception:
+        return "badge"
