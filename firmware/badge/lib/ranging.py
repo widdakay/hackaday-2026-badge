@@ -44,6 +44,18 @@ RANGE_GAP_MS = 150
 SESSION_TIMEOUT_MS = 3000
 PEER_TIMEOUT_MS = 10000    # stop ranging a node not heard for this long
 RESULT_TIMEOUT_MS = 30000  # ignore and drop measurements older than this
+
+# Range bias by the chip that initiated the measurement, subtracted from every
+# raw reading before medians, edges and the map. Measured on 2,382 readings
+# between 3 badges (ESP32-S3) and 5 ftm_node boards (ESP32-C3): on the same
+# pair, a badge-initiated reading is 1.94 m (median, 15 pairs) longer than a
+# C3-initiated one, and C3-initiated readings go down to ~0 m for nodes side
+# by side, while badge-initiated ones bottom out around 0.5-1.8 m. So the C3
+# side is taken as unbiased. Override in data/settings.json, e.g.
+#   {"initiator_bias_m": {"badge": 1.9, "node": 0.0}}
+# and calibrate against a tape measure with ftm_node/tools/ftm_monitor.py.
+INITIATOR_BIAS_M = {"badge": 1.9, "node": 0.0}
+MIN_DISTANCE_CM = 5        # corrected readings are clamped to at least this
 HISTORY = 3                # results kept per directed pair, for the median.
                            # Each pair gets one result per pass (~0.4-0.6 s x number of
                            # peers), so the median spans HISTORY passes: 3 rather than 5
@@ -97,6 +109,7 @@ class RangingService:
         self.results = {}     # (from_mac, to_mac) -> [(cm, ticks_ms), ...]
         self.latest_rtt = {}  # (from_mac, to_mac) -> (round trip ps, ticks_ms)
         self.updated_ms = 0   # last time any distance changed
+        self.bias_cm = {k: v * 100 for k, v in INITIATOR_BIAS_M.items()}
         self._next_number = 1
         # Pass timing: how long one round over every live peer takes, so the
         # app can say how much time the median covers (HISTORY passes).
@@ -113,7 +126,10 @@ class RangingService:
         ap = network.WLAN(network.AP_IF)
         ap.active(True)
         self.mac = bytes(ap.config("mac"))
-        self.name = settings.badge_name("badge-%02X%02X%02X" % (self.mac[3], self.mac[4], self.mac[5]))
+        self.name = settings.badge_name(None) or settings.default_name()
+        bias = dict(INITIATOR_BIAS_M)
+        bias.update(settings.load().get("initiator_bias_m") or {})
+        self.bias_cm = {k: float(v) * 100 for k, v in bias.items()}
         self.numbers[self.mac] = 0
         self.names[self.mac] = self.name
         ap.config(essid=self.name, channel=CHANNEL, hidden=True, authmode=network.AUTH_OPEN)
@@ -202,9 +218,18 @@ class RangingService:
         return nodes, edges
 
     # ---- internals ----------------------------------------------------------
+    def kind_of(self, mac):
+        """'node' for ftm_node boards (ESP32-C3, always named node-XXXXXX),
+        'badge' for everything else, including this badge."""
+        if mac == self.mac:
+            return "badge"
+        return "node" if self.names.get(mac, "").startswith("node-") else "badge"
+
     def _fresh(self, frm, to):
+        """Recent readings from frm to to, in cm, corrected for frm's bias."""
         now = time.ticks_ms()
-        return [cm for cm, t in self.results.get((frm, to), ())
+        bias = self.bias_cm.get(self.kind_of(frm), 0.0)
+        return [max(cm - bias, MIN_DISTANCE_CM) for cm, t in self.results.get((frm, to), ())
                 if time.ticks_diff(now, t) < RESULT_TIMEOUT_MS]
 
     def _heard(self, mac, name, rssi):

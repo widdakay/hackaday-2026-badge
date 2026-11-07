@@ -4,8 +4,8 @@ The screen has three panes:
 
   left          every known node with a fixed number (0 = this badge), its
                 distance from this badge and signal strength
-  right top     the nametag (data/graphics/nametag_small.png, made by
-                scripts/make_nametag.py)
+  right top     the nametag: data/graphics/nametag_small_blank.png with the
+                name from data/settings.json drawn on top (lib/name_render.py)
   right bottom  a map of node positions fitted to every pairwise distance
                 (lib.graph_layout), autoscaled, numbered like the list
 
@@ -34,10 +34,10 @@ import time
 import lvgl
 
 from apps.base_app import BaseApp
-from lib import app_bar, graph_layout
+from lib import app_bar, graph_layout, name_render
 from lib.epd import display, display_height, display_width
 from lib.led_bar import NUM_LEDS, leds
-from lib.ranging import CHANNEL, HISTORY, service
+from lib.ranging import CHANNEL, service
 
 _BG = lvgl.color_hex(0xFFFFFF)
 _FG = lvgl.color_hex(0x000000)
@@ -61,7 +61,8 @@ _TOP = app_bar.HEIGHT
 _SPLIT_X = 478              # vertical divider x 478..481
 _SPLIT_Y = 298              # horizontal divider y 298..301 (right side only)
 _RIGHT_X = _SPLIT_X + 4
-_NAMETAG = "/data/graphics/nametag_small.png"
+_NAMETAG = "/data/graphics/nametag_small_blank.png"
+_TAG_HEADER, _TAG_FOOTER = 80, 22    # black bands in the template (make_nametag.py)
 
 # Left pane: node list.
 _PAD = 20
@@ -299,8 +300,10 @@ class RangingApp(BaseApp):
         # The nametag goes on after LVGL, which paints its whole screen.
         try:
             display.draw_png(_NAMETAG, _TOP, _RIGHT_X)
-        except OSError:
-            print("ranging: %s missing, run scripts/make_nametag.py" % _NAMETAG)
+            name_render.draw_name(display, _RIGHT_X + 30, _TOP + _TAG_HEADER + 15,
+                                  display_width - 30, _SPLIT_Y - _TAG_FOOTER - 15, size=120)
+        except OSError as ex:
+            print("ranging: nametag assets missing, run scripts/make_nametag.py:", ex)
         # Black and white only, so the short waveforms lose nothing.
         layout = (len(nodes), len(rows) > 1)
         if self._drawn_layout is None:
@@ -343,7 +346,6 @@ class RangingApp(BaseApp):
             _label(scr, _PAD, y + 40, "Other badges need the Ranging app open,", _NOTE_FONT)
             _label(scr, _PAD, y + 62, "C3 boards need the ftm_node firmware.", _NOTE_FONT)
 
-        _label(scr, _PAD, display_height - 50, self._timing(), _NOTE_FONT)
         _label(scr, _PAD, display_height - 28, "Numbers match the circles in the map.", _NOTE_FONT)
 
     def _draw_edges(self, fb):
@@ -399,16 +401,6 @@ class RangingApp(BaseApp):
                         fb.line(x0, y0 + o, x1, y1 + o, 1)
                     else:
                         fb.line(x0 + o, y0, x1 + o, y1, 1)
-
-    def _timing(self):
-        """Footer: how long the median window is (a median of 3 means little
-        without knowing whether 3 readings took 8 s or a minute). Pass time in
-        0.5 s steps, so its jitter does not force a redraw."""
-        if service.pass_ms is None or not service.pass_peers:
-            return "Raw FTM, uncalibrated. Median of last %d passes." % HISTORY
-        pass_s = max(0.5, round(service.pass_ms / 500) / 2)
-        return "Raw FTM, uncalibrated. Median of %d passes, ~%d s." % (
-            HISTORY, round(pass_s * HISTORY))
 
     def _draw_graph(self, scr, nodes, edges):
         x0, y0, x1, y1 = _GRAPH_BOX
@@ -483,3 +475,15 @@ class RangingApp(BaseApp):
             _rect(scr, left + bar - 3, by - 8, 3, 12)
             text = ("%g m" % metres) if metres >= 1 else ("%d cm" % int(metres * 100))
             _label(scr, left + bar + 8, by - 10, text, _NOTE_FONT)
+
+        # Fit quality, bottom right: RMS of (measured - map) over the edges.
+        errs = []
+        for (a, b), d in edges.items():
+            if a in pos and b in pos:
+                (xa, ya), (xb, yb) = pos[a], pos[b]
+                errs.append(math.sqrt((xa - xb) ** 2 + (ya - yb) ** 2) - d)
+        if errs:
+            rms = math.sqrt(sum(e * e for e in errs) / len(errs))
+            lbl = _label(scr, 0, 0, "RMS %.2f m" % rms, _NOTE_FONT)
+            lbl.update_layout()
+            lbl.set_pos(x1 - 12 - lbl.get_width(), y1 - 28)

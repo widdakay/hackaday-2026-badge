@@ -1,60 +1,78 @@
 #!/usr/bin/env python3
-"""Render the nametag images with the name in Audiowide.
+"""Build the assets the badge uses to draw your name on its nametags.
 
-The badge's LVGL firmware only ships Montserrat, so the name is drawn here on
-the host and saved as palette PNGs that lib/large_png.py can show directly:
+The badge's LVGL firmware only ships Montserrat, so this renders Audiowide
+glyph sheets on the host once. The badge then draws whatever name is in
+data/settings.json at boot (lib/name_render.py), so changing the name needs
+no firmware rebuild and no rerun of this script: edit the file and reset.
 
-  badge/data/graphics/nametag.png        960 x 672, red/white/black, for the
-                                         Nametag app ("Hello I am..." template)
-  badge/data/graphics/nametag_small.png  478 x 298, black/white, for the top
-                                         right of the Ranging app (it uses the
-                                         black/white fast refresh, so no red)
+Writes, from firmware/:
 
-The name defaults to "name" in badge/data/settings.json, which is also what
-the ranging service broadcasts. Run from firmware/:
+  badge/data/fonts/audiowide_240.bbf      glyphs for the full-screen Nametag
+  badge/data/fonts/audiowide_120.bbf      glyphs for the Ranging app's pane
+  badge/data/graphics/nametag_small_blank.png
+                                          478 x 258 black/white "HELLO / I am..."
+                                          template for the Ranging pane
 
-    .venv/bin/python scripts/make_nametag.py            # name from settings
-    .venv/bin/python scripts/make_nametag.py "Someone"  # override
+    .venv/bin/python scripts/make_nametag.py
+
+.bbf ("badge bitmap font"), little-endian:
+  header  b"BBFN", u16 font size (px), u16 glyph count
+  entries count x <HhhhhHI>: code point, bbox x0, y0, x1, y1 relative to the
+          pen position on the baseline (y down), advance in 1/16 px, offset of
+          the bitmap from the start of the file
+  bitmaps 1 bit per pixel, rows of ceil(w / 8) bytes, MSB = leftmost pixel
 """
 
-import argparse
-import json
 import os
+import struct
 
 from PIL import Image, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BADGE = os.path.join(HERE, "..", "badge")
+FONTS_OUT = os.path.join(BADGE, "data", "fonts")
 GRAPHICS = os.path.join(BADGE, "data", "graphics")
-SETTINGS = os.path.join(BADGE, "data", "settings.json")
-TEMPLATE = os.path.join(GRAPHICS, "hello_i_am_blank.png")
 NAME_FONT = os.path.join(HERE, "fonts", "Audiowide-Regular.ttf")
 LABEL_FONT = os.path.join(HERE, "fonts", "Montserrat-wght.ttf")
 
-# White name band in hello_i_am_blank.png.
-BAND_TOP, BAND_BOTTOM = 221, 557
+SIZES = (240, 120)
+CHARS = [chr(c) for c in range(32, 127)]
 
 # Top of the screen is covered by lib/app_bar.py's bar on every app.
 APP_BAR_H = 40
-
 # Ranging app: the nametag pane is right of the 4 px divider at x 478-481,
 # between the app bar and the divider at y 298-301.
 SMALL_SIZE = (478, 298 - APP_BAR_H)
+SMALL_HEADER, SMALL_FOOTER = 80, 22   # keep in sync with lib/name_render.py
 
-BLACK, WHITE, RED = 0, 1, 2
-PALETTE_3 = [0, 0, 0, 255, 255, 255, 255, 0, 0]
-PALETTE_2 = [0, 0, 0, 255, 255, 255]
+_ENTRY = "<HhhhhHI"
 
 
-def fit_font(path, text, max_w, max_h):
-    size = max_h * 2
-    while size > 10:
-        font = ImageFont.truetype(path, size)
-        left, top, right, bottom = font.getbbox(text)
-        if right - left <= max_w and bottom - top <= max_h:
-            return font
-        size -= 2
-    raise ValueError("name does not fit")
+def build_font(size, path):
+    font = ImageFont.truetype(NAME_FONT, size)
+    glyphs = []
+    for ch in CHARS:
+        x0, y0, x1, y1 = font.getbbox(ch, anchor="ls")
+        adv = round(font.getlength(ch) * 16)
+        w, h = max(0, x1 - x0), max(0, y1 - y0)
+        data = b""
+        if w and h:
+            mask = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(mask).text((-x0, -y0), ch, font=font, fill=255, anchor="ls")
+            bits = mask.point(lambda v: 255 if v >= 128 else 0).convert("1")
+            data = bits.tobytes()   # PIL "1": rows padded to whole bytes, MSB first
+        glyphs.append((ord(ch), x0, y0, x1, y1, adv, data))
+    header = struct.pack("<4sHH", b"BBFN", size, len(glyphs))
+    offset = len(header) + len(glyphs) * struct.calcsize(_ENTRY)
+    entries, blobs = [], []
+    for code, x0, y0, x1, y1, adv, data in glyphs:
+        entries.append(struct.pack(_ENTRY, code, x0, y0, x1, y1, adv, offset))
+        blobs.append(data)
+        offset += len(data)
+    with open(path, "wb") as f:
+        f.write(header + b"".join(entries) + b"".join(blobs))
+    return os.path.getsize(path)
 
 
 def label_font(size, weight):
@@ -64,8 +82,6 @@ def label_font(size, weight):
 
 
 def draw_centered(out, text, font, cx, top, bottom, ink):
-    """Draw text centered in a horizontal band, hard-thresholded so edges stay
-    crisp on e-paper (no anti-aliasing grey to land on the wrong side)."""
     left, t, right, b = font.getbbox(text)
     x = cx - (right - left) // 2 - left
     y = top + ((bottom - top) - (b - t)) // 2 - t
@@ -74,60 +90,26 @@ def draw_centered(out, text, font, cx, top, bottom, ink):
     out.paste(ink, mask=mask.point(lambda v: 255 if v >= 128 else 0))
 
 
-def make_full(name, path):
-    # The template moves down below the app bar; its bottom red band is tall
-    # enough to lose that much.
-    template = Image.open(TEMPLATE).convert("RGB")
-    base = Image.new("RGB", template.size, (255, 255, 255))
-    base.paste(template, (0, APP_BAR_H))
-    width, height = base.size
-    out = Image.new("P", base.size, WHITE)
-    out.putpalette(PALETTE_3)
-    src, dst = base.load(), out.load()
-    for y in range(height):
-        for x in range(width):
-            r, g, b = src[x, y]
-            if r >= 128 and g < 128 and b < 128:
-                dst[x, y] = RED
-            elif r < 128 and g < 128 and b < 128:
-                dst[x, y] = BLACK
-    font = fit_font(NAME_FONT, name, width - 120, BAND_BOTTOM - BAND_TOP - 80)
-    draw_centered(out, name, font, width // 2, BAND_TOP + APP_BAR_H, BAND_BOTTOM + APP_BAR_H, BLACK)
-    out.save(path, optimize=True, interlace=False)
-    return font.size
-
-
-def make_small(name, path):
+def make_small_blank(path):
     w, h = SMALL_SIZE
-    out = Image.new("P", SMALL_SIZE, WHITE)
-    out.putpalette(PALETTE_2)
+    out = Image.new("P", SMALL_SIZE, 1)
+    out.putpalette([0, 0, 0, 255, 255, 255])
     d = ImageDraw.Draw(out)
-    header, footer = 80, 22
-    d.rectangle([0, 0, w - 1, header - 1], fill=BLACK)
-    d.rectangle([0, h - footer, w - 1, h - 1], fill=BLACK)
-    draw_centered(out, "HELLO", label_font(36, 700), w // 2, 4, 50, WHITE)
-    draw_centered(out, "I am...", label_font(20, 600), w // 2, 48, 76, WHITE)
-    font = fit_font(NAME_FONT, name, w - 60, h - header - footer - 30)
-    draw_centered(out, name, font, w // 2, header, h - footer, BLACK)
+    d.rectangle([0, 0, w - 1, SMALL_HEADER - 1], fill=0)
+    d.rectangle([0, h - SMALL_FOOTER, w - 1, h - 1], fill=0)
+    draw_centered(out, "HELLO", label_font(36, 700), w // 2, 4, 50, 1)
+    draw_centered(out, "I am...", label_font(20, 600), w // 2, 48, 76, 1)
     out.save(path, optimize=True, interlace=False, bits=1)
-    return font.size
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("name", nargs="?", help="defaults to name in data/settings.json")
-    args = parser.parse_args()
-    name = args.name
-    if not name:
-        with open(SETTINGS) as f:
-            name = json.load(f)["name"]
-
-    full = os.path.join(GRAPHICS, "nametag.png")
-    small = os.path.join(GRAPHICS, "nametag_small.png")
-    print(f"Wrote {os.path.relpath(full)} ({make_full(name, full)} px Audiowide)")
-    print(f"Wrote {os.path.relpath(small)} ({make_small(name, small)} px Audiowide)")
-    if args.name:
-        print("Note: data/settings.json still has the old name; the ranging beacon uses that.")
+    os.makedirs(FONTS_OUT, exist_ok=True)
+    for size in SIZES:
+        path = os.path.join(FONTS_OUT, "audiowide_%d.bbf" % size)
+        print("Wrote %s (%d KB)" % (os.path.relpath(path), build_font(size, path) // 1024))
+    blank = os.path.join(GRAPHICS, "nametag_small_blank.png")
+    make_small_blank(blank)
+    print("Wrote %s" % os.path.relpath(blank))
 
 
 if __name__ == "__main__":
