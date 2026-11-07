@@ -49,7 +49,7 @@ class NametagApp(BaseApp):
             plate.set_style_pad_all(8, 0)
 
             hello = lvgl.label(plate)
-            hello.set_text("")
+            hello.set_text("Erik")
             hello.set_style_text_color(_BLACK, 0)
             hello.set_style_text_font(_FONT, 0)
 
