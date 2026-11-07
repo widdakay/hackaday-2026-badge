@@ -1,0 +1,6 @@
+build/
+build-s3/
+sdkconfig
+sdkconfig.old
+cal.csv
+.cache/
