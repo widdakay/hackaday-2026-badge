@@ -2,16 +2,22 @@
 //
 //   import ftm
 //   ftm.responder(True)                       # answer other nodes' measurements
-//   ftm.start(mac, channel, frames=16, burst=2)   # mac: 6-byte responder AP MAC
+//   ftm.start(mac, channel, frames=16, burst=0)   # mac: 6-byte responder AP MAC
 //   r = ftm.poll()    # None while running/idle, else a result tuple:
 //       (peer_mac, status, entries, dist_cm, rtt_raw_ns, rtt_est_ns,
 //        rtt_med_ps, rtt_mean_ps, rtt_min_ps, rtt_max_ps)
 //   ftm.busy()        # True while a session is running
 //   ftm.cancel()
+//   ftm.ready()       # True when a result is waiting for poll()
+//
+// When a result arrives the main task is woken, so asyncio code that polls an
+// io.IOBase whose ioctl checks ftm.ready() (see lib/ranging.py) runs at once
+// instead of on its next tick.
 //
 // Wi-Fi must be active first (network.WLAN(network.AP_IF).active(True)).
 #include "py/runtime.h"
 #include "py/mperrno.h"
+#include "mphalport.h"
 #include "esp_err.h"
 
 #include "ftm_core.h"
@@ -34,7 +40,7 @@ static mp_obj_t ftm_start(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
         { MP_QSTR_mac, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
         { MP_QSTR_channel, MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
         { MP_QSTR_frames, MP_ARG_INT, {.u_int = 16} },
-        { MP_QSTR_burst, MP_ARG_INT, {.u_int = 2} },
+        { MP_QSTR_burst, MP_ARG_INT, {.u_int = 0} },
     };
     mp_arg_val_t a[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, a);
@@ -44,6 +50,7 @@ static mp_obj_t ftm_start(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     if (mac.len != 6) {
         mp_raise_ValueError(MP_ERROR_TEXT("mac must be 6 bytes"));
     }
+    ftm_core_set_done_cb(mp_hal_wake_main_task);
     check(ftm_core_start(mac.buf, a[ARG_channel].u_int, a[ARG_frames].u_int, a[ARG_burst].u_int));
     return mp_const_none;
 }
@@ -81,6 +88,11 @@ static mp_obj_t ftm_cancel(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(ftm_cancel_obj, ftm_cancel);
 
+static mp_obj_t ftm_ready(void) {
+    return mp_obj_new_bool(ftm_core_state() == FTM_CORE_DONE);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(ftm_ready_obj, ftm_ready);
+
 static const mp_rom_map_elem_t ftm_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_ftm) },
     { MP_ROM_QSTR(MP_QSTR_responder), MP_ROM_PTR(&ftm_responder_obj) },
@@ -88,6 +100,7 @@ static const mp_rom_map_elem_t ftm_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_poll), MP_ROM_PTR(&ftm_poll_obj) },
     { MP_ROM_QSTR(MP_QSTR_busy), MP_ROM_PTR(&ftm_busy_obj) },
     { MP_ROM_QSTR(MP_QSTR_cancel), MP_ROM_PTR(&ftm_cancel_obj) },
+    { MP_ROM_QSTR(MP_QSTR_ready), MP_ROM_PTR(&ftm_ready_obj) },
     { MP_ROM_QSTR(MP_QSTR_STATUS_OK), MP_ROM_INT(0) },
 };
 static MP_DEFINE_CONST_DICT(ftm_module_globals, ftm_module_globals_table);

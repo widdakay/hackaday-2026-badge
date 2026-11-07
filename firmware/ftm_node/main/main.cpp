@@ -52,9 +52,9 @@ namespace {
 // ---- Configuration --------------------------------------------------------
 constexpr uint8_t kChannel = 6;             // every node must share one channel
 constexpr uint8_t kFrameCount = 16;         // FTM frames per session (16/24/32/64)
-constexpr uint16_t kBurstPeriod = 2;        // FTM burst period, 100 ms units
+constexpr uint16_t kBurstPeriod = 0;        // FTM burst period, 100 ms units; 0 = no preference (fastest), 1 is rejected
 constexpr uint32_t kBeaconPeriodMs = 1000;
-constexpr uint32_t kRangeGapMs = 150;       // pause between ranging sessions
+constexpr uint32_t kSessionTimeoutMs = 1000; // a session takes ~100-300 ms; give up on a busy peer fast
 constexpr int64_t kPeerTimeoutMs = 10000;
 constexpr int kMaxPeers = 24;
 #if CONFIG_IDF_TARGET_ESP32C3
@@ -119,6 +119,7 @@ struct RxPacket {
 };
 
 constexpr EventBits_t kFtmDone = BIT0;
+constexpr EventBits_t kPeerNew = BIT1;   // a node was heard for the first time
 const uint8_t kBroadcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 EventGroupHandle_t g_events;
@@ -135,10 +136,15 @@ void led(bool on) {
     if (kLed != GPIO_NUM_NC) gpio_set_level(kLed, on != kLedActiveLow);
 }
 
+// Turn the LED on and let a one-shot timer turn it off, so the ranging task
+// doesn't sit in a delay for the flash.
+esp_timer_handle_t g_led_timer;
+
 void flash_led(uint32_t ms) {
+    if (kLed == GPIO_NUM_NC) return;
     led(true);
-    vTaskDelay(pdMS_TO_TICKS(ms));
-    led(false);
+    esp_timer_stop(g_led_timer);  // restart if still lit from the last flash
+    esp_timer_start_once(g_led_timer, static_cast<uint64_t>(ms) * 1000);
 }
 
 void fill_header(Header &h, uint8_t type) {
@@ -234,6 +240,7 @@ void peer_heard(const uint8_t *mac, const char *name, int8_t rssi) {
         if (is_new) printf("PEER," MACSTR ",%s,%d\n", MAC2STR(mac), slot->name, rssi);
     }
     xSemaphoreGive(g_peers_lock);
+    if (is_new) xEventGroupSetBits(g_events, kPeerNew);
 }
 
 // Pick the next live peer after index `after`, round robin. Returns -1 if none.
@@ -306,7 +313,8 @@ void beacon_task(void *) {
     }
 }
 
-void range_one(const uint8_t *peer) {
+// One FTM session with `peer`. Returns false if it could not be started.
+bool range_one(const uint8_t *peer) {
     wifi_ftm_initiator_cfg_t cfg = {};
     std::memcpy(cfg.resp_mac, peer, 6);
     cfg.channel = kChannel;
@@ -317,12 +325,12 @@ void range_one(const uint8_t *peer) {
     xEventGroupClearBits(g_events, kFtmDone);
     if (esp_wifi_ftm_initiate_session(&cfg) != ESP_OK) {
         printf("DIST," MACSTR "," MACSTR ",start_err,,,,,0\n", MAC2STR(g_self), MAC2STR(peer));
-        return;
+        return false;
     }
-    if (!(xEventGroupWaitBits(g_events, kFtmDone, pdTRUE, pdFALSE, pdMS_TO_TICKS(3000)) & kFtmDone)) {
+    if (!(xEventGroupWaitBits(g_events, kFtmDone, pdTRUE, pdFALSE, pdMS_TO_TICKS(kSessionTimeoutMs)) & kFtmDone)) {
         esp_wifi_ftm_end_session();
         printf("DIST," MACSTR "," MACSTR ",timeout,,,,,0\n", MAC2STR(g_self), MAC2STR(peer));
-        return;
+        return true;
     }
     wifi_event_ftm_report_t r = g_report;
     Range range = {};
@@ -348,6 +356,7 @@ void range_one(const uint8_t *peer) {
     esp_now_send(kBroadcast, reinterpret_cast<const uint8_t *>(&msg), sizeof(msg));
 
     if (r.status == FTM_STATUS_SUCCESS) flash_led(20);
+    return true;
 }
 
 void range_task(void *) {
@@ -356,12 +365,16 @@ void range_task(void *) {
     while (true) {
         int next = next_peer(idx, peer);
         if (next < 0) {
-            vTaskDelay(pdMS_TO_TICKS(500));
+            // Sleep until a node turns up (peer_heard sets the bit; one set
+            // before this wait just makes it return at once).
+            xEventGroupWaitBits(g_events, kPeerNew, pdTRUE, pdFALSE, portMAX_DELAY);
             continue;
         }
         idx = next;
-        range_one(peer);
-        vTaskDelay(pdMS_TO_TICKS(kRangeGapMs));
+        // No gap between sessions: each one blocks on the driver's report.
+        // Only a failed start returns without blocking, so give up the CPU
+        // for one tick then, or a stuck driver would starve the idle task.
+        if (!range_one(peer)) vTaskDelay(1);
     }
 }
 
@@ -419,6 +432,10 @@ extern "C" void app_main() {
         gpio_reset_pin(kLed);
         gpio_set_direction(kLed, GPIO_MODE_OUTPUT);
         led(false);
+        esp_timer_create_args_t led_timer = {};
+        led_timer.callback = [](void *) { led(false); };
+        led_timer.name = "led";
+        ESP_ERROR_CHECK(esp_timer_create(&led_timer, &g_led_timer));
     }
 
     g_events = xEventGroupCreate();

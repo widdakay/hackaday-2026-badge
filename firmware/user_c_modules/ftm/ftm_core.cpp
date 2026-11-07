@@ -16,6 +16,7 @@ constexpr int kMaxEntries = 64;
 std::atomic<int> g_state{FTM_CORE_IDLE};
 wifi_event_ftm_report_t g_report;  // written by the event task before DONE is set
 bool g_handler_registered = false;
+std::atomic<void (*)(void)> g_done_cb{nullptr};
 
 void on_ftm_report(void *, esp_event_base_t, int32_t, void *data) {
     if (g_state.load() != FTM_CORE_RUNNING) {
@@ -24,6 +25,7 @@ void on_ftm_report(void *, esp_event_base_t, int32_t, void *data) {
     }
     g_report = *static_cast<wifi_event_ftm_report_t *>(data);
     g_state.store(FTM_CORE_DONE);
+    if (auto cb = g_done_cb.load()) cb();
 }
 
 // Per-frame round-trip stats from the driver's report; frees the driver's copy.
@@ -110,3 +112,5 @@ extern "C" int ftm_core_cancel(void) {
     g_state.store(FTM_CORE_IDLE);
     return err;
 }
+
+extern "C" void ftm_core_set_done_cb(void (*cb)(void)) { g_done_cb.store(cb); }

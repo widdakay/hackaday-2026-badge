@@ -48,6 +48,10 @@ int ftm_core_state(void);
 // Abort a running session. Returns an esp_err_t.
 int ftm_core_cancel(void);
 
+// Called from the Wi-Fi event task when a session's result is ready (state
+// becomes FTM_CORE_DONE). Keep it short and thread safe; NULL to clear.
+void ftm_core_set_done_cb(void (*cb)(void));
+
 #ifdef __cplusplus
 }
 #endif

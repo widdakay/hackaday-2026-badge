@@ -27,6 +27,8 @@ RDIST), so firmware/ftm_node/tools/ftm_monitor.py works with a badge on USB.
 """
 
 import asyncio as aio
+from asyncio import core as _aio_core
+import io
 import struct
 import sys
 import time
@@ -39,12 +41,12 @@ import ftm
 from lib import firefly, log, settings
 
 CHANNEL = 6
-FRAMES = 16
-BURST_PERIOD = 2           # 100 ms units
+FRAMES = 16                # smallest fixed count the driver accepts
+BURST_PERIOD = 0           # no preference: fastest (176 ms vs 316 ms at 2); 1 is rejected (ESP_ERR_INVALID_ARG)
 BEACON_MS = 1000
 NAMES_EVERY = 5            # beacons between NAMES broadcasts
-RANGE_GAP_MS = 150
-SESSION_TIMEOUT_MS = 3000
+SESSION_TIMEOUT_MS = 1000  # a session takes ~100-300 ms; a peer busy ranging
+                           # someone else may not answer, so give up quickly
 PEER_TIMEOUT_MS = 10000    # stop ranging a node not heard for this long
 RESULT_TIMEOUT_MS = 30000  # ignore and drop measurements older than this
 
@@ -60,9 +62,8 @@ RESULT_TIMEOUT_MS = 30000  # ignore and drop measurements older than this
 INITIATOR_BIAS_M = {"badge": 1.9, "node": 0.0}
 MIN_DISTANCE_CM = 5        # corrected readings are clamped to at least this
 HISTORY = 3                # results kept per directed pair, for the median.
-                           # Each pair gets one result per pass (~0.4-0.6 s x number of
-                           # peers), so the median spans HISTORY passes: 3 rather than 5
-                           # keeps it responsive, ~8 s with 5 peers, ~30 s with 20.
+                           # Each pair gets one result per pass (one FTM session per
+                           # peer, ~0.1-0.3 s each), so the median spans HISTORY passes.
 
 _MAGIC = b"BBFT"
 _VERSION = 2
@@ -95,6 +96,21 @@ def _median(vals):
     return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
+class _FtmReady(io.IOBase):
+    """Pollable by asyncio: readable once the FTM session has a result. The
+    C module wakes the main task when the result lands, so this fires at once
+    rather than on a timer (same mechanism as asyncio.ThreadSafeFlag)."""
+
+    def ioctl(self, req, flags):
+        if req == 3:  # MP_STREAM_POLL
+            return flags if ftm.ready() else 0
+        return -1
+
+    async def wait(self):
+        if not ftm.ready():
+            yield _aio_core._io_queue.queue_read(self)
+
+
 class Peer:
     """A node this badge hears directly (and ranges)."""
 
@@ -123,6 +139,8 @@ class RangingService:
         self.pass_peers = 0   # peers in the last full pass
         self.passes = 0       # full passes completed; the app redraws when it grows
         self.firefly = firefly.Firefly(self.distance)
+        self._ftm_ready = _FtmReady()
+        self._new_peer = aio.Event()   # set when a node is first heard
         self._espnow = None
         self._tasks = []
 
@@ -247,6 +265,7 @@ class RangingService:
             if name:
                 self.names[mac] = name
             self.number_of(mac)
+            self._new_peer.set()
             print("PEER,%s,%s,%d" % (mac_str(mac), self.name_of(mac), rssi))
         elif name:
             self.names[mac] = name
@@ -370,20 +389,19 @@ class RangingService:
     async def _range_one(self, peer):
         try:
             ftm.start(peer.mac, CHANNEL, frames=FRAMES, burst=BURST_PERIOD)
-        except OSError:
+        except OSError as ex:
             print("DIST,%s,%s,start_err,,,,,0,,,," % (mac_str(self.mac), mac_str(peer.mac)))
             log.error("ranging: ftm.start", ex)
             return
-        t0 = time.ticks_ms()
-        while True:
-            res = ftm.poll()
-            if res is not None:
-                break
-            if time.ticks_diff(time.ticks_ms(), t0) > SESSION_TIMEOUT_MS:
-                ftm.cancel()
-                print("DIST,%s,%s,timeout,,,,,0,,,," % (mac_str(self.mac), mac_str(peer.mac)))
-                return
-            await aio.sleep_ms(20)
+        try:
+            await aio.wait_for_ms(self._ftm_ready.wait(), SESSION_TIMEOUT_MS)
+        except aio.TimeoutError:
+            ftm.cancel()
+            print("DIST,%s,%s,timeout,,,,,0,,,," % (mac_str(self.mac), mac_str(peer.mac)))
+            return
+        res = ftm.poll()
+        if res is None:
+            return
         peer_mac, status, entries, dist_cm, rtt_raw, rtt_est, med, mean, lo, hi = res
         if peer_mac != peer.mac:
             return  # late result from a cancelled session
@@ -438,7 +456,8 @@ class RangingService:
             peers = list(self.peers.values())
             if not peers:
                 pass_t0 = None
-                await aio.sleep_ms(500)
+                self._new_peer.clear()
+                await self._new_peer.wait()
                 continue
             if pass_left <= 0:
                 if pass_t0 is not None:
@@ -453,7 +472,9 @@ class RangingService:
                 print("ranging: range error", ex)
                 sys.print_exception(ex)
                 log.error("ranging: range error", ex)
-            await aio.sleep_ms(RANGE_GAP_MS)
+            # No gap between sessions; only yield, so a session that fails
+            # without awaiting can't starve the beacon, rx and display tasks.
+            await aio.sleep_ms(0)
 
 
 service = RangingService()
