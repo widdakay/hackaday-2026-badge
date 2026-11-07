@@ -26,8 +26,12 @@ that file Ranging uses the name typed into the stock Nametag app
 (apps/nametag.py). --name NAME skips the question. The Nametag app itself
 is not changed.
 
-Inputs, found automatically when the script sits in a release folder (next to
-micropython.bin and badge-files.zip) or in the repo (firmware/scripts/):
+Inputs: by default the latest GitHub release of RELEASE_REPO
+(micropython.bin and badge-files.zip, checked against its SHA256SUMS.txt).
+It is used only if its Ranging supports stock badges; otherwise, or offline,
+the files next to this script are used (a release folder, or the repo's
+firmware/scripts/). To choose:
+  --local           skip GitHub, use the files next to the script
   --firmware PATH   micropython.bin
   --files PATH      badge-files.zip, or a badge/ directory
 Other options: --port, --no-flash (files only), --no-backup, --full-backup,
@@ -39,6 +43,7 @@ Undo: flash the stock micropython.bin from the Hack-a-Day repo
 
 import argparse
 import glob
+import hashlib
 import json
 import re
 import os
@@ -47,6 +52,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 import zipfile
 
 # The Ranging app and what it needs that a stock badge doesn't have.
@@ -61,6 +67,11 @@ FILES = [
     "data/fonts/audiowide_120.bbf",
     "data/graphics/nametag_small_blank.png",
 ]
+
+RELEASE_REPO = "widdakay/hackaday-2026-badge"
+RELEASE_ASSETS = ("micropython.bin", "badge-files.zip", "SHA256SUMS.txt")
+# In apps/ranging.py only from the release that runs on stock badge files.
+STOCK_MARKER = b"STOCK_FRAME_MS"
 
 NAME_MAX_BYTES = 16          # lib/settings.py
 APP_OFFSET = 0x10000
@@ -86,6 +97,56 @@ def ask(msg):
 
 
 # ---- inputs ---------------------------------------------------------------
+
+class ReleaseError(Exception):
+    pass
+
+
+def _get(url, timeout=60):
+    # github.com release links, not the API: no rate limit, no token.
+    req = urllib.request.Request(url, headers={"User-Agent": "install-ranging"})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def fetch_latest(dest):
+    """Download the latest release's assets into dest. Returns the tag."""
+    try:
+        with _get("https://github.com/%s/releases/latest" % RELEASE_REPO, 20) as r:
+            final = r.geturl()
+    except OSError as ex:
+        raise ReleaseError("can't reach GitHub: %s" % ex)
+    if "/releases/tag/" not in final:
+        raise ReleaseError("no published release")
+    tag = final.rsplit("/releases/tag/", 1)[1]
+    print("Latest release: %s (%s)" % (tag, final))
+    for name in RELEASE_ASSETS:
+        url = "https://github.com/%s/releases/download/%s/%s" % (RELEASE_REPO, tag, name)
+        try:
+            with _get(url) as r:
+                data = r.read()
+        except OSError as ex:
+            raise ReleaseError("%s: %s" % (name, ex))
+        with open(os.path.join(dest, name), "wb") as fh:
+            fh.write(data)
+        print("  downloaded %s (%d KB)" % (name, len(data) // 1024))
+    sums = {}
+    with open(os.path.join(dest, "SHA256SUMS.txt")) as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) == 2:
+                sums[parts[1].lstrip("*")] = parts[0].lower()
+    for name in RELEASE_ASSETS[:2]:
+        with open(os.path.join(dest, name), "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        if sums.get(name) != digest:
+            raise ReleaseError("%s doesn't match SHA256SUMS.txt" % name)
+    with zipfile.ZipFile(os.path.join(dest, "badge-files.zip")) as z:
+        app = next((n for n in z.namelist() if n.endswith("apps/ranging.py")), None)
+        if app is None or STOCK_MARKER not in z.read(app):
+            raise ReleaseError("its Ranging app predates stock-badge support")
+    print("  checksums match")
+    return tag
+
 
 def find_firmware(arg):
     cands = [arg] if arg else [
@@ -321,6 +382,7 @@ def main():
     ap.add_argument("--port")
     ap.add_argument("--firmware")
     ap.add_argument("--files")
+    ap.add_argument("--local", action="store_true", help="don't download the latest release")
     ap.add_argument("--no-flash", action="store_true", help="only copy the app files")
     ap.add_argument("--no-backup", action="store_true")
     ap.add_argument("--full-backup", action="store_true", help="back up images too (slow)")
@@ -333,8 +395,20 @@ def main():
         except ImportError:
             die("%s isn't installed: %s -m pip install esptool mpremote" % (mod, PY))
 
-    firmware = None if args.no_flash else find_firmware(args.firmware)
-    files = load_files(args.files)
+    fw_arg, files_arg = args.firmware, args.files
+    if not (args.local or fw_arg or files_arg):
+        dest = tempfile.mkdtemp(prefix="ranging-release-")
+        try:
+            fetch_latest(dest)
+            fw_arg = os.path.join(dest, "micropython.bin")
+            files_arg = os.path.join(dest, "badge-files.zip")
+        except ReleaseError as ex:
+            print("Not using the latest release (%s); using the files next to "
+                  "this script." % ex)
+    firmware = None if args.no_flash else find_firmware(fw_arg)
+    files = load_files(files_arg)
+    if STOCK_MARKER not in files["apps/ranging.py"]:
+        die("this Ranging app predates stock-badge support; use a newer release")
     port = find_port(args.port)
     print("Badge on %s" % port)
 
