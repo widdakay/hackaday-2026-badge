@@ -7,12 +7,9 @@ and C3 nodes discover and range each other:
   * an ESP-NOW beacon every second with this badge's name (lib.settings), sent
     on the AP interface, so the sender MAC is the AP MAC the responder answers on
   * a ranging loop over every node heard in the last PEER_TIMEOUT_MS
-  * an ESP-NOW broadcast of every result; the results other nodes broadcast
-    are collected too, so every badge builds the all-to-all distance table
-    for every pair measured by a node it can hear
-  * badges also broadcast the names of the nodes they hear (NAMES message, new
-    in this version; C3 nodes ignore it), so a node you can't hear directly
-    still gets a name in the list
+  * no retransmission: a badge does not broadcast its own results or relay
+    names. It still collects the results ftm_node boards broadcast (RDIST),
+    so their pairs appear in the map alongside this badge's own.
   * a SYNC broadcast of the firefly LED oscillator (lib.firefly) every
     firefly.SYNC_MS; badges only, the C3 nodes ignore it
 
@@ -44,7 +41,6 @@ CHANNEL = 6
 FRAMES = 16                # smallest fixed count the driver accepts
 BURST_PERIOD = 0           # no preference: fastest (176 ms vs 316 ms at 2); 1 is rejected (ESP_ERR_INVALID_ARG)
 BEACON_MS = 1000
-NAMES_EVERY = 5            # beacons between NAMES broadcasts
 SESSION_TIMEOUT_MS = 1000  # a session takes ~100-300 ms; a peer busy ranging
                            # someone else may not answer, so give up quickly
 PEER_TIMEOUT_MS = 10000    # stop ranging a node not heard for this long
@@ -69,17 +65,11 @@ _MAGIC = b"BBFT"
 _VERSION = 2
 _BEACON = 1
 _RANGE = 2
-_NAMES = 3
 _BEACON_FMT = "<4sBBI16s"          # header, seq, name
 _RANGE_FMT = "<4sBB6sBBbIIIIIII"   # header, to, status, entries, rssi, 7 x u32
-_NAMES_HDR = "<4sBBB"              # header, count; then count x (mac, name)
-_NAMES_ENTRY = "<6s16s"
 _BEACON_LEN = struct.calcsize(_BEACON_FMT)
 _RANGE_LEN = struct.calcsize(_RANGE_FMT)
-_NAMES_HDR_LEN = struct.calcsize(_NAMES_HDR)
-_NAMES_ENTRY_LEN = struct.calcsize(_NAMES_ENTRY)
-_NAMES_MAX = (250 - _NAMES_HDR_LEN) // _NAMES_ENTRY_LEN   # ESP-NOW payload limit
-_SYNC = 4                          # 3 is NAMES
+_SYNC = 4                          # 3 was NAMES (removed; keep it unused)
 _SYNC_FMT = "<4sBBIHH"             # header, firefly cycles, phase (1/65536), period ms
 _SYNC_LEN = struct.calcsize(_SYNC_FMT)
 _BROADCAST = b"\xff" * 6
@@ -126,7 +116,7 @@ class RangingService:
         self.mac = b""
         self.name = ""
         self.peers = {}       # ap_mac -> Peer, nodes heard directly
-        self.names = {}       # ap_mac -> name, from beacons and NAMES relays
+        self.names = {}       # ap_mac -> name, from beacons
         self.numbers = {}     # ap_mac -> display number, 0 = this badge
         self.results = {}     # (from_mac, to_mac) -> [(cm, ticks_ms), ...]
         self.latest_rtt = {}  # (from_mac, to_mac) -> (round trip ps, ticks_ms)
@@ -315,28 +305,12 @@ class RangingService:
             print("ranging: %s send failed" % what, ex)
             log.error("ranging: %s send failed" % what, ex)
 
-    def _names_msg(self):
-        now = time.ticks_ms()
-        entries = [(p.mac, self.names[p.mac]) for p in self.peers.values()
-                   if p.mac in self.names and time.ticks_diff(now, p.last_ms) < PEER_TIMEOUT_MS]
-        entries = entries[:_NAMES_MAX]
-        if not entries:
-            return None
-        parts = [struct.pack(_NAMES_HDR, _MAGIC, _VERSION, _NAMES, len(entries))]
-        for mac, name in entries:
-            parts.append(struct.pack(_NAMES_ENTRY, mac, name.encode()[:16]))
-        return b"".join(parts)
-
     async def _beacon_task(self):
         seq = 0
         name = self.name.encode()[:16]
         while True:
             seq += 1
             self._send(struct.pack(_BEACON_FMT, _MAGIC, _VERSION, _BEACON, seq, name), "beacon")
-            if seq % NAMES_EVERY == 0:
-                msg = self._names_msg()
-                if msg:
-                    self._send(msg, "names")
             if seq % 10 == 1:
                 print("SELF,%s,%s,%d" % (mac_str(self.mac), self.name, CHANNEL))
                 now = time.ticks_ms()
@@ -362,20 +336,6 @@ class RangingService:
                     f = struct.unpack(_RANGE_FMT, msg[:_RANGE_LEN])
                     self._heard(mac, None, rssi)
                     self._record("RDIST", mac, bytes(f[3]), f[4:])
-                elif kind == _NAMES and len(msg) >= _NAMES_HDR_LEN:
-                    self._heard(mac, None, rssi)
-                    count = msg[_NAMES_HDR_LEN - 1]
-                    for i in range(count):
-                        off = _NAMES_HDR_LEN + i * _NAMES_ENTRY_LEN
-                        if off + _NAMES_ENTRY_LEN > len(msg):
-                            break
-                        m, n = struct.unpack(_NAMES_ENTRY, msg[off:off + _NAMES_ENTRY_LEN])
-                        m = bytes(m)
-                        # A name heard first-hand (beacon) wins over a relayed one.
-                        if m != self.mac and m not in self.peers:
-                            n = n.split(b"\x00")[0].decode()
-                            if n:
-                                self.names[m] = n
                 elif kind == _SYNC and len(msg) >= _SYNC_LEN:
                     f = struct.unpack(_SYNC_FMT, msg[:_SYNC_LEN])
                     self._heard(mac, None, rssi)
@@ -407,9 +367,6 @@ class RangingService:
             return  # late result from a cancelled session
         r = (status, entries, peer.rssi, dist_cm, rtt_raw, rtt_est, med, mean, lo, hi)
         self._record("DIST", self.mac, peer.mac, r)
-        self._send(struct.pack(
-            _RANGE_FMT, _MAGIC, _VERSION, _RANGE, peer.mac, status, entries, peer.rssi,
-            dist_cm, rtt_raw, rtt_est, med, mean, lo, hi), "result")
 
     async def _sync_task(self):
         """Broadcast the firefly phase and retune toward the badges nearby."""
