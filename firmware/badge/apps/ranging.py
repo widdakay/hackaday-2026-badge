@@ -3,7 +3,8 @@
 The screen has three panes:
 
   left          every known node with a fixed number (0 = this badge), its
-                distance from this badge and signal strength
+                distance from this badge and signal strength; a QR code to
+                the firmware repo in the bottom corner
   right top     the nametag: data/graphics/nametag_small_blank.png with the
                 name from data/settings.json drawn on top (lib/name_render.py)
   right bottom  a map of node positions fitted to every pairwise distance
@@ -118,6 +119,25 @@ _DRAW_MAX_WAIT_MS = 6000
 _GC_EVERY_MS = 15000        # our own garbage collection, in a gap
 _GC_BUDGET_MS = 500
 
+# Bottom left: a QR code to the firmware repo,
+# https://github.com/widdakay/hackaday-2026-badge (version 3, ECC L, no quiet
+# zone: the white page is the quiet zone). One int per row, MSB = left module.
+# Regenerate with the qrcode package:
+#   q = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, border=0)
+#   q.add_data(url); q.make(fit=True); then each row of q.get_matrix() as bits.
+_QR_ROWS = (
+    0x1fc8877f, 0x105b7041, 0x174e655d, 0x175a985d, 0x1745575d, 0x1054b541,
+    0x1fd5557f, 0x00012000, 0x1f7daaaa, 0x16985f71, 0x065b2d10, 0x163e330a,
+    0x02dba90c, 0x163557f1, 0x067cb59c, 0x161423f2, 0x0f65aaac, 0x10265af5,
+    0x17d0f574, 0x102e01c2, 0x14558ff7, 0x001e9d1f, 0x1fd57b5c, 0x10404311,
+    0x1759e9f5, 0x175e1f0f, 0x1754b7fe, 0x105525aa, 0x1fd5ea74,
+)
+_QR_N = 29
+_QR_SCALE = 2               # 2x2 panel pixels per module
+_QR_SIZE = _QR_N * _QR_SCALE
+_QR_X = _PAD
+_QR_Y = display_height - _QR_SIZE - 10
+
 
 def _label(parent, x, y, text, font, color=_FG, w=None):
     lbl = lvgl.label(parent)
@@ -129,6 +149,23 @@ def _label(parent, x, y, text, font, color=_FG, w=None):
     lbl.set_style_text_color(color, 0)
     lbl.set_text(text)
     return lbl
+
+
+def _draw_qr(fb):
+    """The repo QR code (_QR_ROWS) into the black plane, one fill_rect per run
+    of dark modules in a row."""
+    s = _QR_SCALE
+    for r, bits in enumerate(_QR_ROWS):
+        y = _QR_Y + r * s
+        c = 0
+        while c < _QR_N:
+            if bits >> (_QR_N - 1 - c) & 1:
+                c0 = c
+                while c < _QR_N and bits >> (_QR_N - 1 - c) & 1:
+                    c += 1
+                fb.fill_rect(_QR_X + c0 * s, y, (c - c0) * s, s, 1)
+            else:
+                c += 1
 
 
 def _rect(parent, x, y, w, h, color=_FG):
@@ -364,6 +401,7 @@ class RangingApp(BaseApp):
         scr.update_layout()
         lvgl.refr_now(display.lv_display)
         self._draw_edges(display.black)
+        _draw_qr(display.black)
         # The nametag goes on after LVGL, which paints its whole screen.
         self._paste_nametag()
         # Black and white only, so the short waveforms lose nothing.
@@ -435,7 +473,7 @@ class RangingApp(BaseApp):
             _label(scr, _PAD, y + 40, "Other badges need the Ranging app open,", _NOTE_FONT)
             _label(scr, _PAD, y + 62, "C3 boards need the ftm_node firmware.", _NOTE_FONT)
 
-        _label(scr, _PAD, display_height - 28, "Numbers match the circles in the map.", _NOTE_FONT)
+        _label(scr, _QR_X + _QR_SIZE + 14, _QR_Y + _QR_SIZE // 2 - 14, "Scan for firmware", _DIST_FONT)
 
     def _draw_edges(self, fb):
         """Edges as 3 px lines in the framebuffer, broken wherever they would
