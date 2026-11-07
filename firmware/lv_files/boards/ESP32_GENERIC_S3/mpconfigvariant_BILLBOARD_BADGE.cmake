@@ -11,3 +11,4 @@ list(APPEND MICROPY_DEF_BOARD
 
 # list(APPEND USER_C_MODULES ${CMAKE_CURRENT_LIST_DIR}/../../../../../user_c_modules/badge_utils/micropython.cmake)
 list(APPEND USER_C_MODULES ${CMAKE_CURRENT_LIST_DIR}/../../../../../user_c_modules/ftm/micropython.cmake)
+list(APPEND USER_C_MODULES ${CMAKE_CURRENT_LIST_DIR}/../../../../../user_c_modules/graphlayout/micropython.cmake)

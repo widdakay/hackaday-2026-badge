@@ -256,6 +256,11 @@ class EPaperDisplay:
         self._framebuffer_ready = aio.Event()
         # Fast (short-waveform, black/white) refresh requested for the pending update.
         self._fast_requested = False
+        # Top rows to refresh for the pending update; None = whole panel.
+        self._partial_rows = None
+        # Called by update() just before a frame is handed to the panel, to draw
+        # overlays on top of every app (lib.app_bar installs the app bar here).
+        self.before_update = None
         # Red pigment may be on the film. A fast refresh cannot remove it, so the
         # first fast refresh after red runs on the panel's own waveform instead.
         # Unknown at boot, so assume yes.
@@ -321,8 +326,14 @@ class EPaperDisplay:
         )
         disp.flush_ready()
 
-    def update(self, fast: bool = False):
+    def update(self, fast: bool = False, rows: int | None = None):
         """Done updating the framebuffer, update the display with the contents
+
+        rows=N refreshes only the top N rows (a partial refresh of a strip, used
+        for the app bar): the full image is still sent, but the panel's refresh
+        window (0x90 DRFW) covers just those rows, always with the fast
+        waveform, so the rest of the panel, red included, is left as it is.
+        A full update queued alongside a partial one wins.
 
         fast=True uses the short waveform from data/rendered_luts.py: about 3.3 s
         of waveform instead of about 34-51 s, black and white only. Red in the
@@ -331,10 +342,20 @@ class EPaperDisplay:
         If several updates are queued before the display picks them up, the
         refresh is fast only if every one of them asked for fast.
         """
+        if self.before_update is not None:
+            try:
+                self.before_update()
+            except Exception as ex:
+                print("before_update hook failed:", ex)
         if self._framebuffer_ready.is_set():
             self._fast_requested = self._fast_requested and fast
+            if rows is None or self._partial_rows is None:
+                self._partial_rows = None
+            else:
+                self._partial_rows = max(self._partial_rows, rows)
         else:
             self._fast_requested = fast
+            self._partial_rows = rows
         self._framebuffer_ready.set()
 
     def clear(self):
@@ -366,7 +387,8 @@ class EPaperDisplay:
     async def run(self):
         while True:
             if self._framebuffer_ready.is_set():
-                await self.refresh_now(fast=self._fast_requested)
+                rows = self._partial_rows
+                await self.refresh_now(fast=self._fast_requested, rows=rows)
                 self._framebuffer_ready.clear()
             elif (
                 self._session_mode is not None
@@ -378,7 +400,7 @@ class EPaperDisplay:
                 self._display_updated.set()
             await aio.sleep_ms(100)
 
-    async def refresh_now(self, fast: bool = False):
+    async def refresh_now(self, fast: bool = False, rows: int | None = None):
         """Split the framebuffers into halves and refresh the panel once."""
         if self._halves is None:
             self._halves = [bytearray(half_frame_one_color_size) for _ in range(4)]
@@ -389,7 +411,7 @@ class EPaperDisplay:
         _split_halves(self._framebuffer_red, red_left, red_right)
         log.mark("split framebuffers into halves")
         await self.global_update(
-            black_left, red_left, black_right, red_right, fast=fast, log=log
+            black_left, red_left, black_right, red_right, fast=fast, log=log, rows=rows
         )
         gc.collect()
         self._display_updated.set()
@@ -403,8 +425,11 @@ class EPaperDisplay:
         red_right: bytearray | bytes | memoryview[int],
         fast: bool = False,
         log=None,
+        rows: int | None = None,
     ):
         """Push both halves to the panel and refresh.
+
+        rows=N: partial refresh of the top N rows (see update()).
 
         The half-frame buffers are modified in place (bit reversal, red folding),
         so pass copies, as run() does.
@@ -413,6 +438,13 @@ class EPaperDisplay:
             log = _StageLog()
         n = half_frame_one_color_size
         has_red = _any_set(red_left, n) or _any_set(red_right, n)
+        partial = rows is not None and 0 < rows < display_height
+        if partial:
+            fast = True
+        # DRFW's y counts 4-row groups and its end reads one past the last group
+        # (full screen: 672 / 4 + 1 = 0xA9), the same rule as PDi's 5.81", 7.41"
+        # and 11.98" drivers. So N rows -> ceil(N / 4) + 1.
+        drfw_y_end = (rows + 3) // 4 + 1 if partial else 0xA9
         use_lut = fast
         if fast:
             # Fast refresh is black/white: red is drawn as ink, never dropped.
@@ -421,14 +453,18 @@ class EPaperDisplay:
                 _fold_red_into_black(black_right, red_right, n)
             # A short waveform cannot lift red already on the film. Promote this
             # one refresh to the panel's own waveform; red stays suppressed.
-            if self._red_on_panel:
+            if self._red_on_panel and not partial:
+                # (A partial refresh only drives the bar strip, which has no red.)
                 print("Fast refresh requested but red may be on the panel; using slow waveform once")
                 use_lut = False
         drew_red = has_red and not fast
+        # Outside the window nothing changes, so neither does the red on the film.
+        red_after = self._red_on_panel if partial else drew_red
         log.mark(f"scan red (has_red={has_red}, folded={fast and has_red})")
 
         mode = "fast" if use_lut else "slow"
-        print(f"Updating display to new image ({mode}, driver {'B' if self._driver_b else '8'})")
+        print(f"Updating display to new image ({mode}, driver {'B' if self._driver_b else '8'}"
+              f"{', rows 0-%d' % (rows - 1) if partial else ''})")
 
         # Kept-open session: the panel latches one waveform per session, so a
         # mode change has to close it first (rewriting 0xB0 in an open session
@@ -443,11 +479,11 @@ class EPaperDisplay:
 
         if self._session_mode == mode:
             # Warm: booster is still up and the waveform is still latched.
-            self._send_images(black_left, red_left, black_right, red_right, log)
+            self._send_images(black_left, red_left, black_right, red_right, log, drfw_y_end)
             await self._trigger(use_lut, log)
             self._session_images += 1
             self._session_last_ms = time.ticks_ms()
-            self._red_on_panel = drew_red
+            self._red_on_panel = red_after
             log.mark(f"session kept open ({self._session_images} images)")
             return
 
@@ -455,7 +491,7 @@ class EPaperDisplay:
         log.mark("hard reset")
         if self._driver_b and B1_SEND_BOOSTER_CONFIG:
             self._send_index_data(0x70, [0x71, 0x36])  # booster config, both COGs
-        self._send_images(black_left, red_left, black_right, red_right, log)
+        self._send_images(black_left, red_left, black_right, red_right, log, drfw_y_end)
 
         await self.cog_initial()
         log.mark("COG init register sequence")
@@ -469,7 +505,7 @@ class EPaperDisplay:
         await self._dcdc_soft_start()
         log.mark("DC/DC soft start")
         await self._trigger(use_lut, log)
-        self._red_on_panel = drew_red
+        self._red_on_panel = red_after
         if self.keep_powered:
             self._session_mode = mode
             self._session_images = 1
@@ -670,6 +706,7 @@ class EPaperDisplay:
         black_right: bytearray | bytes | memoryview[int],
         red_right: bytearray | bytes | memoryview[int],
         log=None,
+        drfw_y_end: int = 0xA9,
     ):
         assert len(black_left) == half_frame_one_color_size
         assert len(red_left) == half_frame_one_color_size
@@ -691,7 +728,7 @@ class EPaperDisplay:
         # DUW for both left and right halves
         self._send_index_data(0x13, [0x00, 0x3B, 0x00, 0x00, 0x9F, 0x02])
         # DRFW for Both left and right halves
-        self._send_index_data(0x90, [0x00, 0x3B, 0x00, 0xA9])
+        self._send_index_data(0x90, [0x00, 0x3B, 0x00, drfw_y_end])
         ram_rw_data = [0x3B, 0x00, 0x14]
         self._send_index_data_left(0x12, ram_rw_data)  # RAM_RW for left half
         self._send_index_data_left(0x10, black_left)  # Black frame for left half

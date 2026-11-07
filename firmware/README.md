@@ -25,5 +25,14 @@ You will need to `make clean BOARD=ESP32_GENERIC_S3 BOARD_VARIANT=BILLBOARD_BADG
 
 Flashing the pre-built bin files: From `firmware/` run `python -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 8MB --flash_freq 80m 0x0 bin/bootloader.bin 0x8000 bin/partition-table.bin 0x10000 bin/micropython.bin`. To get into the mode to flash this, you need to hold down the BOOT button while either plugging in or pressing and releasing RESET.
 
+## Building on macOS (notes from the ftm-ranging-ui branch)
+- ESP-IDF v5.2.3: `git clone -b v5.2.3 --depth 1 --recursive --shallow-submodules https://github.com/espressif/esp-idf.git`, then `./install.sh esp32s3` and `python3 tools/idf_tools.py install cmake ninja` (no Homebrew needed). On Python 3.9, if the dependency check complains about `ruamel.yaml`, install `ruamel.yaml==0.17.21` into the IDF Python env.
+- Clone `lvgl/lv_micropython` into `firmware/lv_micropython` and fetch the submodules the ESP32 build needs: `git submodule update --init --depth 1 --recursive user_modules/lv_binding_micropython` and `git submodule update --init --depth 1 lib/berkeley-db-1.xx lib/micropython-lib lib/tinyusb`.
+- Copy `lv_files/boards/ESP32_GENERIC_S3/*` to `lv_micropython/ports/esp32/boards/ESP32_GENERIC_S3/` and `lv_files/user_modules/lv_binding_micropython/lv_conf.h` to `lv_micropython/user_modules/lv_binding_micropython/`.
+- Recent Apple clang fails on `mpy-cross`: `make -C mpy-cross CFLAGS_EXTRA="-Wno-gnu-folding-constant"`.
+- After adding or removing a user C module, `make clean` (with the BOARD/BOARD_VARIANT arguments) before building, or the link fails with `undefined reference to mp_module_lvgl`.
+- User C modules: `user_c_modules/ftm` (Wi-Fi FTM) and `user_c_modules/graphlayout` (the Ranging map's layout solver).
+- Only these Montserrat sizes are compiled in: 14, 16, 24, 28, 32, 36, 40, 44, 48.
+
 ## lv_micropython changes:
 Copy the files from `firmware/lv_files/` to their matching paths, ex: `lv_files/foo/` -> `lv_micropython/foo/`.

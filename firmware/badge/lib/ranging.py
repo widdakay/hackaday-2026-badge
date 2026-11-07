@@ -4,20 +4,23 @@ Speaks the same protocol as firmware/ftm_node (the ESP32-C3 nodes), so badges
 and C3 nodes discover and range each other:
 
   * a hidden softAP on CHANNEL with the FTM responder on (C++ `ftm` module)
-  * an ESP-NOW beacon every second (sent on the AP interface, so the sender
-    MAC is the AP MAC the FTM responder answers on)
+  * an ESP-NOW beacon every second with this badge's name (lib.settings), sent
+    on the AP interface, so the sender MAC is the AP MAC the responder answers on
   * a ranging loop over every node heard in the last PEER_TIMEOUT_MS
-  * an ESP-NOW broadcast of every result, and the results other nodes
-    broadcast are collected too (all-to-all table)
+  * an ESP-NOW broadcast of every result; the results other nodes broadcast
+    are collected too, so every badge builds the all-to-all distance table
+    for every pair measured by a node it can hear
+  * badges also broadcast the names of the nodes they hear (NAMES message, new
+    in this version; C3 nodes ignore it), so a node you can't hear directly
+    still gets a name in the list
 
 It prints the same serial lines as ftm_node (SELF, PEER, PEERS, LOST, DIST,
 RDIST), so firmware/ftm_node/tools/ftm_monitor.py works with a badge on USB.
 
     from lib.ranging import service
-    service.start()            # idempotent; runs in the background
-    service.peers              # {ap_mac: Peer}
-    service.distance(mac)      # median metres over recent results, or None
-    service.latest(mac)        # (round trip ns, age ms) of the newest result, or None
+    service.start()             # idempotent; runs in the background
+    service.distance(mac)       # median metres from this badge, or None
+    service.graph()             # every node and edge with fresh results
 """
 
 import asyncio as aio
@@ -30,24 +33,33 @@ import network
 
 import ftm
 
+from lib import settings
+
 CHANNEL = 6
 FRAMES = 16
 BURST_PERIOD = 2           # 100 ms units
 BEACON_MS = 1000
+NAMES_EVERY = 5            # beacons between NAMES broadcasts
 RANGE_GAP_MS = 150
 SESSION_TIMEOUT_MS = 3000
-PEER_TIMEOUT_MS = 10000
+PEER_TIMEOUT_MS = 10000    # stop ranging a node not heard for this long
+RESULT_TIMEOUT_MS = 30000  # ignore and drop measurements older than this
 HISTORY = 5                # results kept per directed pair, for the median
-                           # (each pair gets a result every ~0.4 s x number of peers)
 
 _MAGIC = b"BBFT"
 _VERSION = 2
 _BEACON = 1
 _RANGE = 2
+_NAMES = 3
 _BEACON_FMT = "<4sBBI16s"          # header, seq, name
 _RANGE_FMT = "<4sBB6sBBbIIIIIII"   # header, to, status, entries, rssi, 7 x u32
+_NAMES_HDR = "<4sBBB"              # header, count; then count x (mac, name)
+_NAMES_ENTRY = "<6s16s"
 _BEACON_LEN = struct.calcsize(_BEACON_FMT)
 _RANGE_LEN = struct.calcsize(_RANGE_FMT)
+_NAMES_HDR_LEN = struct.calcsize(_NAMES_HDR)
+_NAMES_ENTRY_LEN = struct.calcsize(_NAMES_ENTRY)
+_NAMES_MAX = (250 - _NAMES_HDR_LEN) // _NAMES_ENTRY_LEN   # ESP-NOW payload limit
 _BROADCAST = b"\xff" * 6
 PS_TO_CM = 0.0149896229    # one-way cm per picosecond of round trip
 
@@ -56,10 +68,17 @@ def mac_str(mac):
     return ":".join("%02x" % b for b in mac)
 
 
+def _median(vals):
+    s = sorted(vals)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
 class Peer:
+    """A node this badge hears directly (and ranges)."""
+
     def __init__(self, mac):
         self.mac = mac
-        self.name = mac_str(mac)[-8:]
         self.rssi = 0
         self.last_ms = 0
 
@@ -69,10 +88,13 @@ class RangingService:
         self.started = False
         self.mac = b""
         self.name = ""
-        self.peers = {}       # ap_mac -> Peer
-        self.results = {}     # (from_mac, to_mac) -> list of recent cm values
+        self.peers = {}       # ap_mac -> Peer, nodes heard directly
+        self.names = {}       # ap_mac -> name, from beacons and NAMES relays
+        self.numbers = {}     # ap_mac -> display number, 0 = this badge
+        self.results = {}     # (from_mac, to_mac) -> [(cm, ticks_ms), ...]
         self.latest_rtt = {}  # (from_mac, to_mac) -> (round trip ps, ticks_ms)
         self.updated_ms = 0   # last time any distance changed
+        self._next_number = 1
         self._espnow = None
         self._tasks = []
 
@@ -82,8 +104,10 @@ class RangingService:
             return
         ap = network.WLAN(network.AP_IF)
         ap.active(True)
-        self.mac = ap.config("mac")
-        self.name = "badge-%02X%02X%02X" % (self.mac[3], self.mac[4], self.mac[5])
+        self.mac = bytes(ap.config("mac"))
+        self.name = settings.badge_name("badge-%02X%02X%02X" % (self.mac[3], self.mac[4], self.mac[5]))
+        self.numbers[self.mac] = 0
+        self.names[self.mac] = self.name
         ap.config(essid=self.name, channel=CHANNEL, hidden=True, authmode=network.AUTH_OPEN)
         sta = network.WLAN(network.STA_IF)
         sta.active(True)
@@ -102,14 +126,29 @@ class RangingService:
         self.started = True
         print("SELF,%s,%s,%d" % (mac_str(self.mac), self.name, CHANNEL))
 
+    def name_of(self, mac):
+        return self.names.get(mac) or mac_str(mac)[-8:]
+
+    def number_of(self, mac):
+        """Stable display number: assigned the first time a node turns up and
+        kept for the rest of the session, so the list and graph don't renumber."""
+        n = self.numbers.get(mac)
+        if n is None:
+            n = self.numbers[mac] = self._next_number
+            self._next_number += 1
+        return n
+
     def distance(self, to_mac, from_mac=None):
-        """Median distance in metres from `from_mac` (default: this badge) to
-        `to_mac`, over the last HISTORY results; None if nothing yet."""
-        vals = self.results.get((from_mac or self.mac, to_mac))
-        if not vals:
-            return None
-        s = sorted(vals)
-        return s[len(s) // 2] / 100
+        """Median metres from `from_mac` (default: this badge) to `to_mac` over
+        the recent results of that one direction; None if nothing fresh."""
+        vals = self._fresh(from_mac or self.mac, to_mac)
+        return _median(vals) / 100 if vals else None
+
+    def edge(self, a, b):
+        """Metres between a and b using both directions (A ranging B and B
+        ranging A are separate measurements); None if neither is fresh."""
+        vals = self._fresh(a, b) + self._fresh(b, a)
+        return _median(vals) / 100 if vals else None
 
     def latest(self, to_mac, from_mac=None):
         """(round trip in ns, age in ms) of the newest successful result from
@@ -126,16 +165,50 @@ class RangingService:
         live.sort(key=lambda p: (self.distance(p.mac) is None, self.distance(p.mac) or 0))
         return live
 
+    def graph(self):
+        """(nodes, edges) for everything with fresh information.
+
+        nodes: [mac, ...] sorted by display number, this badge first. A node
+               is included if it was heard directly in the last
+               PEER_TIMEOUT_MS or appears in a fresh measurement.
+        edges: {(mac_a, mac_b): metres} with mac_a < mac_b.
+        """
+        now = time.ticks_ms()
+        macs = {self.mac}
+        for p in self.peers.values():
+            if time.ticks_diff(now, p.last_ms) < PEER_TIMEOUT_MS:
+                macs.add(p.mac)
+        edges = {}
+        for (a, b) in self.results:
+            if a == b:
+                continue
+            key = (a, b) if a < b else (b, a)
+            if key in edges:
+                continue
+            d = self.edge(a, b)
+            if d is not None:
+                edges[key] = d
+                macs.add(a)
+                macs.add(b)
+        nodes = sorted(macs, key=self.number_of)
+        return nodes, edges
+
     # ---- internals ----------------------------------------------------------
+    def _fresh(self, frm, to):
+        now = time.ticks_ms()
+        return [cm for cm, t in self.results.get((frm, to), ())
+                if time.ticks_diff(now, t) < RESULT_TIMEOUT_MS]
+
     def _heard(self, mac, name, rssi):
         p = self.peers.get(mac)
         if p is None:
             p = self.peers[mac] = Peer(mac)
             if name:
-                p.name = name
-            print("PEER,%s,%s,%d" % (mac_str(mac), p.name, rssi))
+                self.names[mac] = name
+            self.number_of(mac)
+            print("PEER,%s,%s,%d" % (mac_str(mac), self.name_of(mac), rssi))
         elif name:
-            p.name = name
+            self.names[mac] = name
         p.rssi = rssi
         p.last_ms = time.ticks_ms()
 
@@ -145,15 +218,29 @@ class RangingService:
         if status == ftm.STATUS_OK:
             print("%s,%s,%s,ok,%d,%d,%d,%d,%d,%d,%d,%d,%d" % (
                 tag, mac_str(frm), mac_str(to), dist_cm, rtt_raw, rtt_est, rssi, entries, med, mean, lo, hi))
+            now = time.ticks_ms()
             cm = mean * PS_TO_CM if mean else dist_cm
-            self.latest_rtt[(frm, to)] = (mean if mean else rtt_raw * 1000, time.ticks_ms())
+            self.latest_rtt[(frm, to)] = (mean if mean else rtt_raw * 1000, now)
             vals = self.results.setdefault((frm, to), [])
-            vals.append(cm)
+            vals.append((cm, now))
             if len(vals) > HISTORY:
                 vals.pop(0)
-            self.updated_ms = time.ticks_ms()
+            self.number_of(frm)
+            self.number_of(to)
+            self.updated_ms = now
         else:
             print("%s,%s,%s,fail_%d,,,,%d,0,,,," % (tag, mac_str(frm), mac_str(to), status, rssi))
+
+    def _prune(self):
+        now = time.ticks_ms()
+        for mac, p in list(self.peers.items()):
+            if time.ticks_diff(now, p.last_ms) > PEER_TIMEOUT_MS:
+                print("LOST,%s" % mac_str(mac))
+                del self.peers[mac]
+        for key, vals in list(self.results.items()):
+            if time.ticks_diff(now, vals[-1][1]) > RESULT_TIMEOUT_MS:
+                del self.results[key]
+                self.latest_rtt.pop(key, None)
 
     def _rssi_of(self, mac):
         try:
@@ -161,20 +248,40 @@ class RangingService:
         except (KeyError, IndexError, TypeError):
             return 0
 
+    def _send(self, msg, what):
+        try:
+            self._espnow.send(_BROADCAST, msg, False)
+        except OSError as ex:
+            print("ranging: %s send failed" % what, ex)
+
+    def _names_msg(self):
+        now = time.ticks_ms()
+        entries = [(p.mac, self.names[p.mac]) for p in self.peers.values()
+                   if p.mac in self.names and time.ticks_diff(now, p.last_ms) < PEER_TIMEOUT_MS]
+        entries = entries[:_NAMES_MAX]
+        if not entries:
+            return None
+        parts = [struct.pack(_NAMES_HDR, _MAGIC, _VERSION, _NAMES, len(entries))]
+        for mac, name in entries:
+            parts.append(struct.pack(_NAMES_ENTRY, mac, name.encode()[:16]))
+        return b"".join(parts)
+
     async def _beacon_task(self):
         seq = 0
         name = self.name.encode()[:16]
         while True:
             seq += 1
-            try:
-                self._espnow.send(_BROADCAST, struct.pack(_BEACON_FMT, _MAGIC, _VERSION, _BEACON, seq, name), False)
-            except OSError as ex:
-                print("ranging: beacon send failed", ex)
+            self._send(struct.pack(_BEACON_FMT, _MAGIC, _VERSION, _BEACON, seq, name), "beacon")
+            if seq % NAMES_EVERY == 0:
+                msg = self._names_msg()
+                if msg:
+                    self._send(msg, "names")
             if seq % 10 == 1:
                 print("SELF,%s,%s,%d" % (mac_str(self.mac), self.name, CHANNEL))
                 now = time.ticks_ms()
                 for p in self.peers.values():
-                    print("PEERS,%s,%s,%d,%d" % (mac_str(p.mac), p.name, p.rssi, time.ticks_diff(now, p.last_ms)))
+                    print("PEERS,%s,%s,%d,%d" % (mac_str(p.mac), self.name_of(p.mac), p.rssi,
+                                                 time.ticks_diff(now, p.last_ms)))
             await aio.sleep_ms(BEACON_MS)
 
     async def _rx_task(self):
@@ -184,14 +291,30 @@ class RangingService:
                 mac, msg = await e.arecv()
                 if not msg or len(msg) < 6 or msg[:4] != _MAGIC or msg[4] != _VERSION:
                     continue
+                mac = bytes(mac)
                 rssi = self._rssi_of(mac)
-                if msg[5] == _BEACON and len(msg) >= _BEACON_LEN:
+                kind = msg[5]
+                if kind == _BEACON and len(msg) >= _BEACON_LEN:
                     name = struct.unpack(_BEACON_FMT, msg[:_BEACON_LEN])[4].split(b"\x00")[0].decode()
-                    self._heard(bytes(mac), name, rssi)
-                elif msg[5] == _RANGE and len(msg) >= _RANGE_LEN:
+                    self._heard(mac, name, rssi)
+                elif kind == _RANGE and len(msg) >= _RANGE_LEN:
                     f = struct.unpack(_RANGE_FMT, msg[:_RANGE_LEN])
-                    self._heard(bytes(mac), None, rssi)
-                    self._record("RDIST", bytes(mac), bytes(f[3]), f[4:])
+                    self._heard(mac, None, rssi)
+                    self._record("RDIST", mac, bytes(f[3]), f[4:])
+                elif kind == _NAMES and len(msg) >= _NAMES_HDR_LEN:
+                    self._heard(mac, None, rssi)
+                    count = msg[_NAMES_HDR_LEN - 1]
+                    for i in range(count):
+                        off = _NAMES_HDR_LEN + i * _NAMES_ENTRY_LEN
+                        if off + _NAMES_ENTRY_LEN > len(msg):
+                            break
+                        m, n = struct.unpack(_NAMES_ENTRY, msg[off:off + _NAMES_ENTRY_LEN])
+                        m = bytes(m)
+                        # A name heard first-hand (beacon) wins over a relayed one.
+                        if m != self.mac and m not in self.peers:
+                            n = n.split(b"\x00")[0].decode()
+                            if n:
+                                self.names[m] = n
             except Exception as ex:
                 print("ranging: rx error", ex)
                 sys.print_exception(ex)
@@ -200,7 +323,7 @@ class RangingService:
     async def _range_one(self, peer):
         try:
             ftm.start(peer.mac, CHANNEL, frames=FRAMES, burst=BURST_PERIOD)
-        except OSError as ex:
+        except OSError:
             print("DIST,%s,%s,start_err,,,,,0,,,," % (mac_str(self.mac), mac_str(peer.mac)))
             return
         t0 = time.ticks_ms()
@@ -218,21 +341,14 @@ class RangingService:
             return  # late result from a cancelled session
         r = (status, entries, peer.rssi, dist_cm, rtt_raw, rtt_est, med, mean, lo, hi)
         self._record("DIST", self.mac, peer.mac, r)
-        try:
-            self._espnow.send(_BROADCAST, struct.pack(
-                _RANGE_FMT, _MAGIC, _VERSION, _RANGE, peer.mac, status, entries, peer.rssi,
-                dist_cm, rtt_raw, rtt_est, med, mean, lo, hi), False)
-        except OSError as ex:
-            print("ranging: result send failed", ex)
+        self._send(struct.pack(
+            _RANGE_FMT, _MAGIC, _VERSION, _RANGE, peer.mac, status, entries, peer.rssi,
+            dist_cm, rtt_raw, rtt_est, med, mean, lo, hi), "result")
 
     async def _range_task(self):
         idx = 0
         while True:
-            now = time.ticks_ms()
-            for mac, p in list(self.peers.items()):
-                if time.ticks_diff(now, p.last_ms) > PEER_TIMEOUT_MS:
-                    print("LOST,%s" % mac_str(mac))
-                    del self.peers[mac]
+            self._prune()
             peers = list(self.peers.values())
             if not peers:
                 await aio.sleep_ms(500)

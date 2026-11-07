@@ -55,6 +55,12 @@ async def main():
     _display_task = aio.create_task(display.run())
     _led_task = aio.create_task(leds.update())
     _apps_task = aio.create_task(switcher.arun())
+    try:
+        from lib import app_bar
+        from lib.battery import monitor as battery_monitor
+        _battery_task = aio.create_task(battery_monitor(app_bar.refresh))
+    except Exception as ex:
+        print("Battery monitor not started:", ex)
 
     print("Running main loop...")
     while True:

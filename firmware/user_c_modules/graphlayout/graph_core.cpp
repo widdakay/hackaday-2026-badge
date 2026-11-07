@@ -1,0 +1,135 @@
+// Stress-majorization layout core, see graph_core.h.
+#include "graph_core.h"
+
+#include <cmath>
+#include <cstring>
+
+namespace {
+
+constexpr int kMaxNodes = GRAPH_MAX_NODES;
+constexpr int kMaxEdges = kMaxNodes * (kMaxNodes - 1) / 2;
+
+// Adjacency in CSR form, built once per solve: neighbours of node i are
+// nbr[off[i]] .. nbr[off[i + 1] - 1], with target length len[] and weight w[].
+struct Graph {
+    int n = 0;
+    int off[kMaxNodes + 1];
+    uint16_t nbr[2 * kMaxEdges];
+    float len[2 * kMaxEdges];
+    float w[2 * kMaxEdges];
+    float inv_wsum[kMaxNodes];
+    float scale = 1.0f;  // longest edge, for scattering restarts
+};
+
+Graph g_graph;  // static: ~50 KB is too much for a task stack
+
+bool build(Graph &g, int n, int m, const uint16_t *ei, const uint16_t *ej, const float *ed) {
+    if (n < 0 || n > kMaxNodes || m < 0 || m > kMaxEdges) return false;
+    g.n = n;
+    int deg[kMaxNodes] = {};
+    for (int k = 0; k < m; k++) {
+        if (ei[k] >= n || ej[k] >= n) return false;
+        if (ei[k] == ej[k]) continue;
+        deg[ei[k]]++;
+        deg[ej[k]]++;
+    }
+    g.off[0] = 0;
+    for (int i = 0; i < n; i++) g.off[i + 1] = g.off[i] + deg[i];
+    int fill[kMaxNodes];
+    std::memcpy(fill, g.off, sizeof(int) * n);
+    g.scale = 0.0f;
+    for (int k = 0; k < m; k++) {
+        int a = ei[k], b = ej[k];
+        if (a == b) continue;
+        float d = ed[k] < 0.05f ? 0.05f : ed[k];
+        float w = 1.0f / (d * d);
+        g.nbr[fill[a]] = b; g.len[fill[a]] = d; g.w[fill[a]] = w; fill[a]++;
+        g.nbr[fill[b]] = a; g.len[fill[b]] = d; g.w[fill[b]] = w; fill[b]++;
+        if (d > g.scale) g.scale = d;
+    }
+    for (int i = 0; i < n; i++) {
+        float s = 0.0f;
+        for (int e = g.off[i]; e < g.off[i + 1]; e++) s += g.w[e];
+        g.inv_wsum[i] = s > 0.0f ? 1.0f / s : 0.0f;
+    }
+    if (g.scale <= 0.0f) g.scale = 1.0f;
+    return true;
+}
+
+// Gauss-Seidel sweeps of the localized SMACOF update.
+void relax(const Graph &g, float *x, float *y, int iterations) {
+    for (int it = 0; it < iterations; it++) {
+        for (int i = 0; i < g.n; i++) {
+            if (g.off[i] == g.off[i + 1]) continue;  // isolated
+            float xi = x[i], yi = y[i], sx = 0.0f, sy = 0.0f;
+            for (int e = g.off[i]; e < g.off[i + 1]; e++) {
+                int j = g.nbr[e];
+                float dx = xi - x[j], dy = yi - y[j];
+                float dist = std::sqrt(dx * dx + dy * dy);
+                if (dist < 1e-6f) {  // coincident: nudge apart deterministically
+                    dx = 1e-3f; dy = 0.0f; dist = 1e-3f;
+                }
+                float f = g.len[e] / dist;
+                sx += g.w[e] * (x[j] + f * dx);
+                sy += g.w[e] * (y[j] + f * dy);
+            }
+            x[i] = sx * g.inv_wsum[i];
+            y[i] = sy * g.inv_wsum[i];
+        }
+    }
+}
+
+float stress(const Graph &g, const float *x, const float *y) {
+    float s = 0.0f;
+    for (int i = 0; i < g.n; i++) {
+        for (int e = g.off[i]; e < g.off[i + 1]; e++) {
+            int j = g.nbr[e];
+            if (j < i) continue;  // each edge once
+            float dx = x[i] - x[j], dy = y[i] - y[j];
+            float r = std::sqrt(dx * dx + dy * dy) - g.len[e];
+            s += r * r * g.w[e];
+        }
+    }
+    return s;
+}
+
+uint32_t next(uint32_t &state) {  // xorshift32
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+}  // namespace
+
+extern "C" float graph_core_solve(int n, float *xs, float *ys,
+                                  int m, const uint16_t *ei, const uint16_t *ej, const float *ed,
+                                  int iterations, int restarts, float margin, uint32_t seed) {
+    Graph &g = g_graph;
+    if (!build(g, n, m, ei, ej, ed)) return -1.0f;
+    if (n == 0) return 0.0f;
+
+    relax(g, xs, ys, iterations);
+    float best = stress(g, xs, ys);
+
+    float tx[kMaxNodes], ty[kMaxNodes];
+    uint32_t state = seed ? seed : 0x9E3779B9u;
+    for (int r = 0; r < restarts && best > 1e-8f; r++) {
+        for (int i = 0; i < n; i++) {
+            if (g.off[i] == g.off[i + 1]) {  // isolated: leave where it was
+                tx[i] = xs[i]; ty[i] = ys[i];
+                continue;
+            }
+            tx[i] = ((next(state) & 0xFFFF) / 65535.0f - 0.5f) * 2.0f * g.scale;
+            ty[i] = ((next(state) & 0xFFFF) / 65535.0f - 0.5f) * 2.0f * g.scale;
+        }
+        relax(g, tx, ty, iterations);
+        float s = stress(g, tx, ty);
+        if (s < best * (1.0f - margin)) {
+            best = s;
+            std::memcpy(xs, tx, sizeof(float) * n);
+            std::memcpy(ys, ty, sizeof(float) * n);
+        }
+    }
+    return best;
+}
