@@ -17,6 +17,7 @@ RDIST), so firmware/ftm_node/tools/ftm_monitor.py works with a badge on USB.
     service.start()            # idempotent; runs in the background
     service.peers              # {ap_mac: Peer}
     service.distance(mac)      # median metres over recent results, or None
+    service.latest(mac)        # (round trip ns, age ms) of the newest result, or None
 """
 
 import asyncio as aio
@@ -36,7 +37,8 @@ BEACON_MS = 1000
 RANGE_GAP_MS = 150
 SESSION_TIMEOUT_MS = 3000
 PEER_TIMEOUT_MS = 10000
-HISTORY = 9                # results kept per directed pair, for the median
+HISTORY = 5                # results kept per directed pair, for the median
+                           # (each pair gets a result every ~0.4 s x number of peers)
 
 _MAGIC = b"BBFT"
 _VERSION = 2
@@ -69,6 +71,7 @@ class RangingService:
         self.name = ""
         self.peers = {}       # ap_mac -> Peer
         self.results = {}     # (from_mac, to_mac) -> list of recent cm values
+        self.latest_rtt = {}  # (from_mac, to_mac) -> (round trip ps, ticks_ms)
         self.updated_ms = 0   # last time any distance changed
         self._espnow = None
         self._tasks = []
@@ -108,6 +111,14 @@ class RangingService:
         s = sorted(vals)
         return s[len(s) // 2] / 100
 
+    def latest(self, to_mac, from_mac=None):
+        """(round trip in ns, age in ms) of the newest successful result from
+        `from_mac` (default: this badge) to `to_mac`; None if nothing yet."""
+        r = self.latest_rtt.get((from_mac or self.mac, to_mac))
+        if r is None:
+            return None
+        return r[0] / 1000, time.ticks_diff(time.ticks_ms(), r[1])
+
     def live_peers(self):
         """Peers heard recently, nearest first (unknown distances last)."""
         now = time.ticks_ms()
@@ -135,6 +146,7 @@ class RangingService:
             print("%s,%s,%s,ok,%d,%d,%d,%d,%d,%d,%d,%d,%d" % (
                 tag, mac_str(frm), mac_str(to), dist_cm, rtt_raw, rtt_est, rssi, entries, med, mean, lo, hi))
             cm = mean * PS_TO_CM if mean else dist_cm
+            self.latest_rtt[(frm, to)] = (mean if mean else rtt_raw * 1000, time.ticks_ms())
             vals = self.results.setdefault((frm, to), [])
             vals.append(cm)
             if len(vals) > HISTORY:
