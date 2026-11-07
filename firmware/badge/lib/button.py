@@ -29,9 +29,17 @@ class Button:
         if self.value and self._pressed_state == UNPRESSED:
             self._pressed_state = PRESSED_UNREAD
             self._press_onset_ms = time.ticks_ms()
-        if not self.value: # and self._pressed_state == PRESSED_READ:
+        # A press stays latched until pressed() reads it, even after release:
+        # apps can block the loop for seconds (PNG loads, LVGL), and clearing
+        # on release lost quick taps.
+        if not self.value and self._pressed_state == PRESSED_READ:
             self._pressed_state = UNPRESSED
             self._press_onset_ms = None
+
+    def discard(self):
+        """Drop a latched press nobody read."""
+        if self._pressed_state == PRESSED_UNREAD:
+            self._pressed_state = PRESSED_READ
 
     def pressed(self) -> bool:
         """Was a button pressed? Only returns True once for each press."""
