@@ -11,6 +11,7 @@ from lib.button import MenuMinus, MenuPlus, UserA, UserB, PRESSED_READ
 from lib.led_bar import leds
 from lib import app_bar
 from lib.epd import display
+from lib import log
 
 # MENU_TIMEOUT_MILLISECONDS = 1000
 
@@ -72,6 +73,7 @@ class AppSwitcher:
             except Exception as exc:
                 print(f"Failed to load app module: {appmod}")
                 sys.print_exception(exc)
+                log.error(f"loading app module {appmod_name}", exc)
 
         try:
             apps_file = open("/data/app_list", "r+b")
@@ -130,6 +132,7 @@ class AppSwitcher:
                         app_bar.refresh()
                 if UserA.pressed() or UserB.pressed():
                     print(f"Switching to {self.apps[self.selection_idx].name}")
+                    log.info(f"app start {self.apps[self.selection_idx].name} {log.mem()}")
                     self.active_idx = self.selection_idx
                     self.apps[self.active_idx].launched = True
                     self._bar_dirty_ms = None
@@ -148,6 +151,7 @@ class AppSwitcher:
                     MenuMinus._pressed_state = PRESSED_READ
                     MenuPlus._pressed_state = PRESSED_READ
                     print("Activated app switching")
+                    log.info(f"app leave {self.apps[self.active_idx].name}")
                 await self.apps[self.active_idx].arun()
                 await aio.sleep_ms(0)
                 self.apps[self.active_idx].launched = False

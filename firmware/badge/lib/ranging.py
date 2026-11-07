@@ -34,6 +34,7 @@ import network
 import ftm
 
 from lib import settings
+from lib import log
 
 CHANNEL = 6
 FRAMES = 16
@@ -133,6 +134,7 @@ class RangingService:
         self._tasks = [aio.create_task(t()) for t in (self._beacon_task, self._rx_task, self._range_task)]
         self.started = True
         print("SELF,%s,%s,%d" % (mac_str(self.mac), self.name, CHANNEL))
+        log.info("ranging: started as %s %s" % (self.name, mac_str(self.mac)))
 
     def name_of(self, mac):
         return self.names.get(mac) or mac_str(mac)[-8:]
@@ -261,6 +263,7 @@ class RangingService:
             self._espnow.send(_BROADCAST, msg, False)
         except OSError as ex:
             print("ranging: %s send failed" % what, ex)
+            log.error("ranging: %s send failed" % what, ex)
 
     def _names_msg(self):
         now = time.ticks_ms()
@@ -326,6 +329,7 @@ class RangingService:
             except Exception as ex:
                 print("ranging: rx error", ex)
                 sys.print_exception(ex)
+                log.error("ranging: rx error", ex)
                 await aio.sleep_ms(100)
 
     async def _range_one(self, peer):
@@ -333,6 +337,7 @@ class RangingService:
             ftm.start(peer.mac, CHANNEL, frames=FRAMES, burst=BURST_PERIOD)
         except OSError:
             print("DIST,%s,%s,start_err,,,,,0,,,," % (mac_str(self.mac), mac_str(peer.mac)))
+            log.error("ranging: ftm.start", ex)
             return
         t0 = time.ticks_ms()
         while True:
@@ -389,6 +394,7 @@ class RangingService:
             except Exception as ex:
                 print("ranging: range error", ex)
                 sys.print_exception(ex)
+                log.error("ranging: range error", ex)
             await aio.sleep_ms(RANGE_GAP_MS)
 
 

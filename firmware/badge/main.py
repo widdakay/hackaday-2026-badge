@@ -2,6 +2,10 @@ import micropython
 import time
 import asyncio as aio
 
+from lib import log
+
+log.boot()
+
 try:
     time.sleep(0.5)
     print("Importing libraries...")
@@ -19,7 +23,12 @@ except Exception as ex:
 
     time.sleep(1)
     sys.print_exception(ex)
+    log.error("import failed", ex)
     raise
+
+# Log every 5th 60 s heartbeat: the last one before a crash says roughly when
+# it happened and how much memory was left.
+HEARTBEAT_LOG_EVERY = 5
 
 
 async def main():
@@ -50,6 +59,8 @@ async def main():
         leds.fill((0,1,0))
 
     print("Initializing main...")
+    # A background task that dies with an exception lands in the log.
+    aio.get_event_loop().set_exception_handler(log.asyncio_handler)
 
     _button_task = aio.create_task(button_scan())
     _display_task = aio.create_task(display.run())
@@ -63,13 +74,25 @@ async def main():
         print("Battery monitor not started:", ex)
 
     print("Running main loop...")
+    log.info("running " + log.mem())
+    beat = 0
     while True:
         print("Main 60s heartbeat --^v--^v--")
         micropython.mem_info()
+        if beat % HEARTBEAT_LOG_EVERY == 0:
+            app = "menu" if switcher.selecting_mode else switcher.apps[switcher.active_idx].name
+            log.info("heartbeat app=%s %s" % (app, log.mem()))
+        beat += 1
         await aio.sleep(60)
 
 
 if __name__ == "__main__":
-
-
-    aio.run(main())
+    try:
+        aio.run(main())
+    except KeyboardInterrupt:
+        # Ctrl-C, also what mpremote sends when it connects.
+        log.info("stopped: KeyboardInterrupt")
+        raise
+    except BaseException as ex:
+        log.error("main loop crashed", ex)
+        raise

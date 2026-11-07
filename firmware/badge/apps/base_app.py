@@ -4,6 +4,8 @@ import asyncio as aio
 import gc
 import sys
 
+from lib import log
+
 
 class BaseApp:
     """Base class to derive other app from.
@@ -31,6 +33,7 @@ class BaseApp:
             print(f"{self.name} hit an exception {ex}")
             sys.print_exception(ex)
             gc.collect()
+            log.error(f"app {self.name}", ex)
         await aio.sleep_ms(self.sleep_ms)
 
     def run(self):
