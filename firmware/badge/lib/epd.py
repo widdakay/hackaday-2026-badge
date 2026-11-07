@@ -96,6 +96,11 @@ EPD_TIMING_LOG = True
 # no shutdown (about 2.5 s saved per update). Changeable at runtime through
 # display.keep_powered. Off by default: the booster's idle draw is unmeasured.
 KEEP_POWERED = False
+# Waveform passes per fast refresh on driver B (E2969JS0B1). Each pass runs
+# for a fixed ~1070 ms whatever the table, so the dose is delivered as several
+# passes of the latched table. update(fast=True, passes=1) trades contrast and
+# ghosting for speed; a later 3-pass refresh cleans the ghosts up.
+FAST_PASSES = 3
 # Close the session after this long without a refresh.
 KEEP_POWERED_IDLE_MS = 60_000
 # The reference tears the session down every 20 images regardless.
@@ -152,6 +157,60 @@ def _fold_red_into_black(black: ptr8, red: ptr8, n: int):
         black[i] = black[i] | red[i]
         red[i] = 0
         i += 1
+
+
+@micropython.viper
+def _invert_inplace(buf: ptr8, n: int):
+    i = 0
+    while i < n:
+        buf[i] = buf[i] ^ 0xFF
+        i += 1
+
+
+def _build_lutb_diff() -> bytes:
+    """Differential short waveform for driver B (E2969JS0B1), 400 bytes.
+
+    The COG picks a table from (red bit << 1) | bw bit. A differential
+    refresh sends the previous frame in the red plane, so the four tables
+    become the four transitions:
+
+        table 0  white -> white   GND throughout: static pixels get no drive
+        table 1  white -> black   shake, then VDH chopped 1:1 with GND
+        table 2  black -> white   shake, then VDL chopped 1:1 with GND
+        table 3  black -> black   GND throughout
+        table 4  VCOM             GND
+
+    Measured on this COG: one frame is 29.5 ms, and a group ends when the
+    shortest table in it ends (erratum 4); ph2 adds no frames. So every table
+    carries the same counts here, and with on = off = 1, repeat = 1 a group
+    plays its level byte literally, one frame per phase: 4 frames. A group
+    cannot be shorter (a zero group runs ~4 s), so 10 groups = 40 frames =
+    1.18 s is the shortest pass possible.
+
+        g0      shake: VDL VDH VDL VDH (or mirrored). Balanced.
+        g1-g6   VDH GND VDH GND (or VDL GND ...): 12 drive frames, 354 ms
+        g7-g9   GND: rest, so the panel is static for the last ~0.35 s
+
+    DC: a pixel gets +12 frames when it turns black and -12 when it turns
+    white, so its net charge is bounded by one transition and never builds
+    up, whatever is shown for however long. The short fast table (lutb_base)
+    instead gives every static paper pixel -16 and every static ink pixel +8
+    frames per pass, which is what leaves red ghosts.
+    """
+    shake = {1: 0x99, 2: 0x66}   # VDL VDH VDL VDH / VDH VDL VDH VDL
+    drive = {1: 0x44, 2: 0x88}   # VDH GND VDH GND / VDL GND VDL GND
+    out = bytearray()
+    for table in range(5):
+        for group in range(10):
+            if table in (1, 2) and group == 0:
+                level = shake[table]
+            elif table in (1, 2) and group <= 6:
+                level = drive[table]
+            else:
+                level = 0x00
+            # level, (on, off, ph2) x 2, repeat. Same counts in every table.
+            out += bytes((level, 1, 1, 1, 1, 1, 1, 1))
+    return bytes(out)
 
 
 @micropython.viper
@@ -256,6 +315,17 @@ class EPaperDisplay:
         self._framebuffer_ready = aio.Event()
         # Fast (short-waveform, black/white) refresh requested for the pending update.
         self._fast_requested = False
+        # Waveform passes for the pending fast refresh (None = FAST_PASSES).
+        self._passes_requested = None
+        # Differential refresh (previous frame sent in the red plane) requested,
+        # and a balanced flash (inverted frame, then the real one) with it.
+        self._diff_requested = False
+        self._flash_requested = False
+        self._diff_lut = None
+        # The black halves hold the frame last sent to the panel; it is
+        # bit-reversed in place on driver B once sent.
+        self._halves_valid = False
+        self._halves_reversed = False
         # Red pigment may be on the film. A fast refresh cannot remove it, so the
         # first fast refresh after red runs on the panel's own waveform instead.
         # Unknown at boot, so assume yes.
@@ -321,7 +391,8 @@ class EPaperDisplay:
         )
         disp.flush_ready()
 
-    def update(self, fast: bool = False):
+    def update(self, fast: bool = False, passes: int | None = None,
+               differential: bool = False, flash: bool = False):
         """Done updating the framebuffer, update the display with the contents
 
         fast=True uses the short waveform from data/rendered_luts.py: about 3.3 s
@@ -330,11 +401,35 @@ class EPaperDisplay:
         earlier update, that refresh runs the slow waveform once to clear it.
         If several updates are queued before the display picks them up, the
         refresh is fast only if every one of them asked for fast.
+
+        passes (driver B, fast only): waveform passes, default FAST_PASSES (3).
+        passes=1 is about 1.1 s of waveform instead of 3.2 s, at lower contrast,
+        and cannot fully clear the previous frame, so ghosts build up until a
+        refresh with the full FAST_PASSES. Pair it with keep_powered = True to
+        also skip the ~2.5 s of reset, init and power-up per frame. Queued
+        updates use the largest pass count asked for.
+
+        differential=True (driver B, fast): one pass of the differential table
+        (_build_lutb_diff): only pixels that changed since the last frame are
+        driven, with a DC-balanced drive, so static content gets no charge and
+        nothing builds up. 1.18 s of waveform. flash=True first sends the
+        inverted frame and then the real one: every pixel gets an equal push
+        both ways and ends firmly at its rail, the balanced way to wipe the
+        light ghosts single passes leave. Falls back to a normal fast refresh
+        if the previous frame on the panel is not known or red may be on it.
         """
+        want = FAST_PASSES if passes is None else passes
         if self._framebuffer_ready.is_set():
             self._fast_requested = self._fast_requested and fast
+            have = FAST_PASSES if self._passes_requested is None else self._passes_requested
+            self._passes_requested = max(have, want)
+            self._diff_requested = self._diff_requested and differential
+            self._flash_requested = self._flash_requested or flash
         else:
             self._fast_requested = fast
+            self._passes_requested = want
+            self._diff_requested = differential
+            self._flash_requested = flash
         self._framebuffer_ready.set()
 
     def clear(self):
@@ -366,7 +461,9 @@ class EPaperDisplay:
     async def run(self):
         while True:
             if self._framebuffer_ready.is_set():
-                await self.refresh_now(fast=self._fast_requested)
+                await self.refresh_now(fast=self._fast_requested, passes=self._passes_requested,
+                                       differential=self._diff_requested,
+                                       flash=self._flash_requested)
                 self._framebuffer_ready.clear()
             elif (
                 self._session_mode is not None
@@ -378,10 +475,14 @@ class EPaperDisplay:
                 self._display_updated.set()
             await aio.sleep_ms(100)
 
-    async def refresh_now(self, fast: bool = False):
+    async def refresh_now(self, fast: bool = False, passes: int | None = None,
+                          differential: bool = False, flash: bool = False):
         """Split the framebuffers into halves and refresh the panel once."""
         if self._halves is None:
             self._halves = [bytearray(half_frame_one_color_size) for _ in range(4)]
+        if differential and fast and self._driver_b and self._halves_valid and not self._red_on_panel:
+            await self._refresh_differential(flash)
+            return
         black_left, black_right, red_left, red_right = self._halves
         self._display_updated.clear()
         log = _StageLog()
@@ -389,8 +490,46 @@ class EPaperDisplay:
         _split_halves(self._framebuffer_red, red_left, red_right)
         log.mark("split framebuffers into halves")
         await self.global_update(
-            black_left, red_left, black_right, red_right, fast=fast, log=log
+            black_left, red_left, black_right, red_right, fast=fast, log=log, passes=passes
         )
+        self._halves_valid = True
+        self._halves_reversed = self._reverse_fb_bits
+        gc.collect()
+        self._display_updated.set()
+        log.total()
+
+    async def _refresh_differential(self, flash: bool):
+        """Refresh with the previous frame in the red plane (see update()).
+
+        The black halves still hold the frame last sent (bit-reversed on
+        driver B), so they become this frame's red plane and the new frame is
+        split into the other two buffers: no extra 80 KB of memory.
+        """
+        self._display_updated.clear()
+        log = _StageLog()
+        n = half_frame_one_color_size
+        old_l, old_r, new_l, new_r = self._halves
+        if self._halves_reversed:
+            _translate_inplace(old_l, n, _REVERSE_TABLE)
+            _translate_inplace(old_r, n, _REVERSE_TABLE)
+        _split_halves(self._framebuffer_black, new_l, new_r)
+        log.mark("split new frame; previous frame as red plane")
+        if flash:
+            # Inverted frame first: every pixel is driven away from its target.
+            _invert_inplace(new_l, n)
+            _invert_inplace(new_r, n)
+            await self.global_update(new_l, old_l, new_r, old_r, log=log, differential=True)
+            # The inverted frame is now what the panel shows: it becomes the
+            # previous frame, and the real one goes into the freed buffers.
+            if self._reverse_fb_bits:
+                _translate_inplace(new_l, n, _REVERSE_TABLE)
+                _translate_inplace(new_r, n, _REVERSE_TABLE)
+            old_l, old_r, new_l, new_r = new_l, new_r, old_l, old_r
+            _split_halves(self._framebuffer_black, new_l, new_r)
+            log.mark("flash: inverted frame done, now the real one")
+        await self.global_update(new_l, old_l, new_r, old_r, log=log, differential=True)
+        self._halves = [new_l, new_r, old_l, old_r]
+        self._halves_reversed = self._reverse_fb_bits
         gc.collect()
         self._display_updated.set()
         log.total()
@@ -403,6 +542,8 @@ class EPaperDisplay:
         red_right: bytearray | bytes | memoryview[int],
         fast: bool = False,
         log=None,
+        passes: int | None = None,
+        differential: bool = False,
     ):
         """Push both halves to the panel and refresh.
 
@@ -412,9 +553,16 @@ class EPaperDisplay:
         if log is None:
             log = _StageLog()
         n = half_frame_one_color_size
-        has_red = _any_set(red_left, n) or _any_set(red_right, n)
+        if differential:
+            # The red planes carry the previous frame, not red: no folding, no
+            # red scan, one pass of the differential table.
+            has_red = False
+            fast = True
+            passes = 1
+        else:
+            has_red = _any_set(red_left, n) or _any_set(red_right, n)
         use_lut = fast
-        if fast:
+        if fast and not differential:
             # Fast refresh is black/white: red is drawn as ink, never dropped.
             if has_red:
                 _fold_red_into_black(black_left, red_left, n)
@@ -427,7 +575,7 @@ class EPaperDisplay:
         drew_red = has_red and not fast
         log.mark(f"scan red (has_red={has_red}, folded={fast and has_red})")
 
-        mode = "fast" if use_lut else "slow"
+        mode = "diff" if differential else ("fast" if use_lut else "slow")
         print(f"Updating display to new image ({mode}, driver {'B' if self._driver_b else '8'})")
 
         # Kept-open session: the panel latches one waveform per session, so a
@@ -444,7 +592,7 @@ class EPaperDisplay:
         if self._session_mode == mode:
             # Warm: booster is still up and the waveform is still latched.
             self._send_images(black_left, red_left, black_right, red_right, log)
-            await self._trigger(use_lut, log)
+            await self._trigger(use_lut, log, passes)
             self._session_images += 1
             self._session_last_ms = time.ticks_ms()
             self._red_on_panel = drew_red
@@ -463,12 +611,12 @@ class EPaperDisplay:
             # The only window for 0xB0: after the last waveform-load strobe in
             # cog_initial (which loads the OTP waveform into these registers) and
             # before the DC/DC soft start. Both CS low, so both COGs latch it.
-            lut = self._get_fast_lut()
+            lut = self._get_diff_lut() if differential else self._get_fast_lut()
             self._send_index_data(0xB0, lut)
             log.mark(f"write 0xB0 waveform ({len(lut)} B)")
         await self._dcdc_soft_start()
         log.mark("DC/DC soft start")
-        await self._trigger(use_lut, log)
+        await self._trigger(use_lut, log, passes)
         self._red_on_panel = drew_red
         if self.keep_powered:
             self._session_mode = mode
@@ -479,12 +627,14 @@ class EPaperDisplay:
             await self._dcdc_soft_shutdown()
             log.mark("DC/DC soft shutdown")
 
-    async def _trigger(self, use_lut: bool, log):
+    async def _trigger(self, use_lut: bool, log, passes: int | None = None):
         if use_lut and self._driver_b:
             # Driver B runs a fixed ~1070 ms window per trigger whatever the table
-            # length, so the dose is delivered as three pulls of the latched table.
-            for pull in range(3):
-                await self._display_refresh(log, f"pull {pull + 1}/3: ")
+            # length, so the dose is delivered as several pulls of the latched
+            # table (FAST_PASSES by default, fewer for low-contrast frames).
+            n = FAST_PASSES if passes is None else max(1, min(int(passes), 6))
+            for pull in range(n):
+                await self._display_refresh(log, f"pull {pull + 1}/{n}: ")
         else:
             await self._display_refresh(log)
 
@@ -498,6 +648,11 @@ class EPaperDisplay:
         self._session_images = 0
         if log:
             log.mark("DC/DC soft shutdown (session closed)")
+
+    def _get_diff_lut(self) -> bytes:
+        if self._diff_lut is None:
+            self._diff_lut = _build_lutb_diff()
+        return self._diff_lut
 
     def _get_fast_lut(self) -> bytes:
         """The short waveform for this COG revision, loaded on first use."""

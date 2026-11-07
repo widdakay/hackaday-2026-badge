@@ -37,8 +37,10 @@ BEACON_MS = 1000
 RANGE_GAP_MS = 150
 SESSION_TIMEOUT_MS = 3000
 PEER_TIMEOUT_MS = 10000
-HISTORY = 5                # results kept per directed pair, for the median
-                           # (each pair gets a result every ~0.4 s x number of peers)
+HISTORY = 3                # results kept per directed pair, for the median.
+                           # Each pair gets one result per pass (~0.4-0.6 s x number of
+                           # peers), so the median spans HISTORY passes: 3 rather than 5
+                           # keeps it responsive, ~8 s with 5 peers, ~30 s with 20.
 
 _MAGIC = b"BBFT"
 _VERSION = 2
@@ -73,6 +75,11 @@ class RangingService:
         self.results = {}     # (from_mac, to_mac) -> list of recent cm values
         self.latest_rtt = {}  # (from_mac, to_mac) -> (round trip ps, ticks_ms)
         self.updated_ms = 0   # last time any distance changed
+        # Pass timing: how long one round over every live peer takes, so the
+        # app can say how much time the median covers (HISTORY passes).
+        self.pass_ms = None   # smoothed time to range every peer once
+        self.pass_peers = 0   # peers in the last full pass
+        self.passes = 0       # full passes completed; the app redraws when it grows
         self._espnow = None
         self._tasks = []
 
@@ -225,8 +232,22 @@ class RangingService:
         except OSError as ex:
             print("ranging: result send failed", ex)
 
+    def _pass_done(self, ms, n):
+        """One full pass (n sessions, ms long, gaps and timeouts included).
+
+        Prints PASS,<self mac>,<peers>,<ms> on serial. A pass grows with the
+        number of peers, and with timeouts when many nodes share the channel."""
+        self.pass_peers = n
+        self.passes += 1
+        # Light smoothing: one slow session should not jump the footer.
+        self.pass_ms = ms if self.pass_ms is None else (3 * self.pass_ms + ms) / 4
+        print("PASS,%s,%d,%d" % (mac_str(self.mac), n, ms))
+
     async def _range_task(self):
         idx = 0
+        pass_t0 = None   # start of the current pass
+        pass_left = 0    # sessions left in it
+        pass_n = 0
         while True:
             now = time.ticks_ms()
             for mac, p in list(self.peers.items()):
@@ -235,8 +256,15 @@ class RangingService:
                     del self.peers[mac]
             peers = list(self.peers.values())
             if not peers:
+                pass_t0 = None
                 await aio.sleep_ms(500)
                 continue
+            if pass_left <= 0:
+                if pass_t0 is not None:
+                    self._pass_done(time.ticks_diff(now, pass_t0), pass_n)
+                pass_t0 = now
+                pass_left = pass_n = len(peers)
+            pass_left -= 1
             idx = (idx + 1) % len(peers)
             try:
                 await self._range_one(peers[idx])
