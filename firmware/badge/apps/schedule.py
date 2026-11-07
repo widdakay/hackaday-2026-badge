@@ -413,7 +413,9 @@ class ScheduleApp(BaseApp):
         # hangs into the next band.
         for path, col, row, _img_w, _img_h in sorted(self._images, key=lambda item: -item[2]):
             display.draw_png(path, row, col)
-        display.update()
+        # Black and white only (text plus the day/stage pictures), so the short
+        # waveform loses nothing. The first one after a red screen runs slow once.
+        display.update(fast=True)
         leds.fill((0,1,0))
 
     def _build(self, talks):
