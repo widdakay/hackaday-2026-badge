@@ -13,6 +13,8 @@ and C3 nodes discover and range each other:
   * badges also broadcast the names of the nodes they hear (NAMES message, new
     in this version; C3 nodes ignore it), so a node you can't hear directly
     still gets a name in the list
+  * a SYNC broadcast of the firefly LED oscillator (lib.firefly) every
+    firefly.SYNC_MS; badges only, the C3 nodes ignore it
 
 It prints the same serial lines as ftm_node (SELF, PEER, PEERS, LOST, DIST,
 RDIST), so firmware/ftm_node/tools/ftm_monitor.py works with a badge on USB.
@@ -21,6 +23,7 @@ RDIST), so firmware/ftm_node/tools/ftm_monitor.py works with a badge on USB.
     service.start()             # idempotent; runs in the background
     service.distance(mac)       # median metres from this badge, or None
     service.graph()             # every node and edge with fresh results
+    service.firefly             # lib.firefly.Firefly, synced with the badges nearby
 """
 
 import asyncio as aio
@@ -33,8 +36,7 @@ import network
 
 import ftm
 
-from lib import settings
-from lib import log
+from lib import firefly, log, settings
 
 CHANNEL = 6
 FRAMES = 16
@@ -64,6 +66,9 @@ _RANGE_LEN = struct.calcsize(_RANGE_FMT)
 _NAMES_HDR_LEN = struct.calcsize(_NAMES_HDR)
 _NAMES_ENTRY_LEN = struct.calcsize(_NAMES_ENTRY)
 _NAMES_MAX = (250 - _NAMES_HDR_LEN) // _NAMES_ENTRY_LEN   # ESP-NOW payload limit
+_SYNC = 4                          # 3 is NAMES
+_SYNC_FMT = "<4sBBIHH"             # header, firefly cycles, phase (1/65536), period ms
+_SYNC_LEN = struct.calcsize(_SYNC_FMT)
 _BROADCAST = b"\xff" * 6
 PS_TO_CM = 0.0149896229    # one-way cm per picosecond of round trip
 
@@ -104,6 +109,7 @@ class RangingService:
         self.pass_ms = None   # smoothed time to range every peer once
         self.pass_peers = 0   # peers in the last full pass
         self.passes = 0       # full passes completed; the app redraws when it grows
+        self.firefly = firefly.Firefly(self.distance)
         self._espnow = None
         self._tasks = []
 
@@ -131,7 +137,7 @@ class RangingService:
         e.add_peer(_BROADCAST, channel=CHANNEL, ifidx=network.AP_IF)
         self._espnow = e
 
-        self._tasks = [aio.create_task(t()) for t in (self._beacon_task, self._rx_task, self._range_task)]
+        self._tasks = [aio.create_task(t()) for t in (self._beacon_task, self._rx_task, self._range_task, self._sync_task)]
         self.started = True
         print("SELF,%s,%s,%d" % (mac_str(self.mac), self.name, CHANNEL))
         log.info("ranging: started as %s %s" % (self.name, mac_str(self.mac)))
@@ -326,6 +332,10 @@ class RangingService:
                             n = n.split(b"\x00")[0].decode()
                             if n:
                                 self.names[m] = n
+                elif kind == _SYNC and len(msg) >= _SYNC_LEN:
+                    f = struct.unpack(_SYNC_FMT, msg[:_SYNC_LEN])
+                    self._heard(mac, None, rssi)
+                    self.firefly.heard(mac, f[3], f[4] / 65536, f[5])
             except Exception as ex:
                 print("ranging: rx error", ex)
                 sys.print_exception(ex)
@@ -357,6 +367,29 @@ class RangingService:
         self._send(struct.pack(
             _RANGE_FMT, _MAGIC, _VERSION, _RANGE, peer.mac, status, entries, peer.rssi,
             dist_cm, rtt_raw, rtt_est, med, mean, lo, hi), "result")
+
+    async def _sync_task(self):
+        """Broadcast the firefly phase and retune toward the badges nearby."""
+        fly = self.firefly
+        last_cycle = None
+        while True:
+            try:
+                fly.adjust()
+                cycles, phase, period = fly.state()
+                self._send(struct.pack(
+                    _SYNC_FMT, _MAGIC, _VERSION, _SYNC, cycles & 0xFFFFFFFF,
+                    int(phase * 65536) & 0xFFFF, int(period)), "sync")
+                if cycles != last_cycle:
+                    # FLY,<self mac>,<cycle>,<period ms>,<offset ms>,<weight>:
+                    # offset is how far the weighted mean of the others is
+                    # ahead (+) or behind; it shrinks toward 0 as they sync.
+                    print("FLY,%s,%d,%d,%d,%.2f" % (mac_str(self.mac), cycles, period,
+                                                    fly.offset * firefly.PERIOD_MS, fly.weight))
+                    last_cycle = cycles
+            except Exception as ex:
+                print("ranging: sync error", ex)
+                log.error("ranging: sync error", ex)
+            await aio.sleep_ms(firefly.SYNC_MS)
 
     def _pass_done(self, ms, n):
         """One full pass (n sessions, ms long, gaps and timeouts included).

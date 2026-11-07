@@ -10,8 +10,20 @@ The screen has three panes:
                 (lib.graph_layout), autoscaled, numbered like the list
 
 The first launch starts lib.ranging's background service, which keeps
-measuring after you switch apps. While the app is open the LED bar runs a red
-Cylon sweep.
+measuring after you switch apps. While the app is open the LEDs flash like
+fireflies: every ~2 s a wave of light runs along the bar, a different
+direction and colours each time, and the badges nearby pull each other into
+step, gradually, until they ripple together (lib/firefly.py). Closer badges
+pull harder (weight 1 / distance).
+
+A redraw blocks everything, the LEDs included. Measured on the badge: map
+layout ~60-120 ms, LVGL render of the three panes ~0.9 s, SPI send to the
+panel 0.36 s (0.72 s with a balanced flash). That is more than one dark gap
+between two flashes (~1.2 s), so a redraw runs as three steps, one per gap
+(_in_gap): layout, render, send. The nametag PNG is decoded once and blitted
+from a cache afterwards (decoding it took ~375 ms per redraw). The app also
+collects garbage itself in a gap, so an automatic collection (~330 ms) never
+lands mid-flash.
 
 Live mode (from the main branch's Ranging): the panel stays powered
 (display.keep_powered) and the screen redraws once per full pass over the
@@ -28,13 +40,16 @@ of a few metres that depends on the chip types involved.
 """
 
 import asyncio as aio
+import framebuf
+import gc
 import math
+import sys
 import time
 
 import lvgl
 
 from apps.base_app import BaseApp
-from lib import app_bar, graph_layout
+from lib import app_bar, graph_layout, log
 from lib.epd import display, display_height, display_width
 from lib.led_bar import NUM_LEDS, leds
 from lib.ranging import CHANNEL, HISTORY, service
@@ -80,53 +95,27 @@ _GRAPH_PAD = _GRAPH_R + 8
 _SCALE_BAR_H = 26           # reserved below the plot for the scale bar
 _NICE_METRES = (0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100)
 
-# LEDs: red Cylon sweep while the app is open; once ranging has started, the
-# nearest-node meter (from the main branch) while any other app is running.
-_CYLON_MS = 70
-_CYLON_TRAIL = (16, 4, 1)   # head, then fading tail (the LEDs are bright)
-_METER_COLOR = (0, 2, 0)
-_METRES_PER_LED = 1.0
-_METER_MS = 500
-
-
-def _cylon():
-    """LED sequence: a red dot sweeping back and forth with a fading tail."""
-    path = list(range(NUM_LEDS)) + list(range(NUM_LEDS - 2, 0, -1))
-    step = 0
-    while True:
-        vals = [(0, 0, 0)] * NUM_LEDS
-        for age, level in enumerate(_CYLON_TRAIL):
-            idx = path[(step - age) % len(path)]
-            if vals[idx][0] < level:
-                vals[idx] = (level, 0, 0)
-        yield vals, _CYLON_MS
-        step = (step + 1) % len(path)
-
-
-def _meter_leds():
-    """Nearest node as a green bar: more LEDs = closer."""
-    peers = service.live_peers()
-    d = service.distance(peers[0].mac) if peers else None
-    vals = [(0, 0, 0)] * NUM_LEDS
-    if d is not None:
-        lit = max(1, NUM_LEDS - int(d / _METRES_PER_LED))
-        vals = [_METER_COLOR if i < lit else (0, 0, 0) for i in range(NUM_LEDS)]
-    leds.set(vals)
-    leds.write()
-
-
-async def _meter_task(app):
-    """Show the meter whenever another app is running (not in the app menu,
-    which uses the LEDs itself, and not in this app, which runs the Cylon)."""
-    from lib.app_switcher import switcher
-    while True:
-        await aio.sleep_ms(_METER_MS)
-        try:
-            active = switcher.apps[switcher.active_idx]
-            if not switcher.selecting_mode and active is not app:
-                _meter_leds()
-        except Exception as ex:
-            print("ranging: LED meter failed:", ex)
+# LEDs: the firefly flash (lib/firefly.py) while the app is open, dark
+# between flashes. Other apps keep the LEDs to themselves.
+_DARK = [(0, 0, 0)] * NUM_LEDS
+_LED_TICK_MS = 20           # LED redraw interval while the app is open
+# Blocking work waits for the dark gap between flashes (>= 1.18 s) and starts
+# only with at least this long left before the next flash: the render
+# (~0.9 s measured, nametag from the cache)...
+_DRAW_BUDGET_MS = 1050
+# ...the send: display.update() (~50 ms with the app bar), then the driver's
+# split and SPI send, 0.36 s (a balanced flash sends a second frame after a
+# 1.2 s waveform, which can still land in the next flash)...
+_SEND_BUDGET_MS = 900
+# ...and the map layout: ~0.1 s with the firmware's C solver, up to its time
+# budget in pure Python, which is cut to what is left of the gap.
+_LAYOUT_MIN_DARK_MS = 500
+_LAYOUT_MARGIN_MS = 250
+# A redraw that has waited this long runs anyway (the gap shrinks while the
+# period is being pulled toward the badges nearby).
+_DRAW_MAX_WAIT_MS = 6000
+_GC_EVERY_MS = 15000        # our own garbage collection, in a gap
+_GC_BUDGET_MS = 500
 
 
 def _label(parent, x, y, text, font, color=_FG, w=None):
@@ -187,7 +176,14 @@ class RangingApp(BaseApp):
         self._drawn_passes = -1     # service.passes at the last frame
         self._drawn_layout = None   # None = next frame is a plain fast refresh
         self._live_frames = 0
-        self._meter = None          # background LED meter task, started on launch
+        self._period_ms = self.sleep_ms
+        self._pending = False       # a redraw is waiting for a gap between flashes
+        self._pending_ms = 0
+        self._snap = None           # its snapshot, once the layout step has run
+        self._send = None           # display.update() kwargs of a rendered frame
+        self._send_ms = 0
+        self._nametag = None        # decoded nametag pixels (framebuf), see _paste_nametag
+        self._gc_ms = time.ticks_ms()
         self._scr = None
         self._edges = []         # map edges to draw after LVGL, see _draw_edges
         self._pos = {}           # mac -> (x, y) metres from the last layout
@@ -199,11 +195,10 @@ class RangingApp(BaseApp):
             # power-up per frame. The driver closes the session after 60 s idle
             # or on a slow (red) refresh from another app.
             display.keep_powered = True
-            leds.unpause()       # the app menu pauses the sequencer
-            leds.set_sequence(_cylon)
-            if self._meter is None:
-                self._meter = aio.create_task(_meter_task(self))
             self._drawn_layout = None  # first frame is always a plain one
+            self._pending = False
+            self._snap = None
+            self._send = None
             self._draw()
             return
         if not display.is_done_updating():
@@ -217,9 +212,71 @@ class RangingApp(BaseApp):
         if set(nodes) == self._drawn_nodes and service.passes == self._drawn_passes:
             return
         if self._key() != self._drawn_key:
-            self._draw()
+            # Drawn by _in_gap() while the LEDs are dark.
+            if not self._pending:
+                self._pending = True
+                self._pending_ms = time.ticks_ms()
         else:
             self._drawn_passes = service.passes
+
+    # ---- LEDs and the work done between flashes ------------------------------
+    async def arun(self):
+        """run() every _period_ms as before, and the LEDs every _LED_TICK_MS
+        in between. The switcher only awaits this while the app is in front,
+        so the LEDs are left alone in the menu and in other apps."""
+        t0 = time.ticks_ms()
+        self.sleep_ms = 0
+        await super().arun()  # run(), with its exceptions caught and logged
+        while time.ticks_diff(time.ticks_ms(), t0) < self._period_ms:
+            self._render_leds()
+            self._in_gap()
+            await aio.sleep_ms(_LED_TICK_MS)
+
+    def _render_leds(self):
+        if not service.started:
+            return
+        try:
+            leds.set(service.firefly.led_values(NUM_LEDS) or _DARK)
+            leds.write()
+        except Exception as ex:
+            # Must not escape: arun() is awaited by the app switcher itself.
+            sys.print_exception(ex)
+            log.error("ranging: LED render", ex)
+
+    def _in_gap(self):
+        """Do the blocking work while the LEDs are dark, one step per call:
+        send a rendered frame, or lay out, or render (each in a gap with
+        enough time left before the next flash)."""
+        if not service.started:
+            return
+        try:
+            now = time.ticks_ms()
+            dark = service.firefly.dark_ms(now)
+            if self._send is not None:
+                # The framebuffer holds a rendered frame: nothing else may draw
+                # until it has gone to the panel.
+                if dark >= _SEND_BUDGET_MS or time.ticks_diff(now, self._send_ms) > _DRAW_MAX_WAIT_MS:
+                    kwargs, self._send = self._send, None
+                    display.update(**kwargs)
+                    self._drawn_ms = time.ticks_ms()
+                return
+            late = self._pending and time.ticks_diff(now, self._pending_ms) > _DRAW_MAX_WAIT_MS
+            if self._pending and self._snap is None:
+                if dark >= _LAYOUT_MIN_DARK_MS or late:
+                    budget = graph_layout.BUDGET_MS if late else max(100, dark - _LAYOUT_MARGIN_MS)
+                    self._snap = self._snapshot()
+                    self._relayout(self._snap, budget)
+            elif self._pending:
+                if dark >= _DRAW_BUDGET_MS or late:
+                    snap, self._snap, self._pending = self._snap, None, False
+                    self._render(snap, send=False)
+            elif dark >= _GC_BUDGET_MS and time.ticks_diff(now, self._gc_ms) > _GC_EVERY_MS:
+                self._gc_ms = now
+                gc.collect()
+        except Exception as ex:
+            self._pending, self._snap, self._send = False, None, None
+            sys.print_exception(ex)
+            log.error("ranging: redraw in gap", ex)
 
     # ---- what's on screen ---------------------------------------------------
     def _rows(self, nodes, edges):
@@ -270,12 +327,22 @@ class RangingApp(BaseApp):
 
     # ---- drawing ------------------------------------------------------------
     def _draw(self):
-        nodes, edges, rows, key = self._snapshot()
+        """Layout and render at once (first frame after launch)."""
+        snap = self._snapshot()
+        self._relayout(snap, graph_layout.BUDGET_MS)
+        self._render(snap)
+
+    def _relayout(self, snap, budget_ms):
+        nodes, edges, _, _ = snap
         t0 = time.ticks_ms()
-        self._pos = graph_layout.layout(nodes, edges, self._pos)
+        self._pos = graph_layout.layout(nodes, edges, self._pos, budget_ms=budget_ms)
         print("ranging: layout of %d nodes, %d edges took %d ms" % (
             len(nodes), len(edges), time.ticks_diff(time.ticks_ms(), t0)))
 
+    def _render(self, snap, send=True):
+        """Draw the frame into the framebuffer. send=False leaves the panel
+        update to _in_gap() (self._send), in a later gap."""
+        nodes, edges, rows, key = snap
         scr = lvgl.obj()
         scr.remove_style_all()
         scr.set_size(display_width, display_height)
@@ -297,28 +364,49 @@ class RangingApp(BaseApp):
         lvgl.refr_now(display.lv_display)
         self._draw_edges(display.black)
         # The nametag goes on after LVGL, which paints its whole screen.
-        try:
-            display.draw_png(_NAMETAG, _TOP, _RIGHT_X)
-        except OSError:
-            print("ranging: %s missing, run scripts/make_nametag.py" % _NAMETAG)
+        self._paste_nametag()
         # Black and white only, so the short waveforms lose nothing.
         layout = (len(nodes), len(rows) > 1)
         if self._drawn_layout is None:
             # First frame after launch: a normal fast refresh (slow once if red
             # is on the panel) so the driver knows what the panel shows.
-            display.update(fast=True)
+            kwargs = {"fast": True}
             self._live_frames = 0
         elif layout != self._drawn_layout or self._live_frames >= CLEAN_EVERY:
-            display.update(fast=True, differential=True, flash=True)
+            kwargs = {"fast": True, "differential": True, "flash": True}
             self._live_frames = 0
         else:
-            display.update(fast=True, differential=True)
+            kwargs = {"fast": True, "differential": True}
             self._live_frames += 1
+        if send:
+            display.update(**kwargs)
+        else:
+            self._send = kwargs
+            self._send_ms = time.ticks_ms()
         self._drawn_layout = layout
         self._drawn_ms = time.ticks_ms()
         self._drawn_key = key
         self._drawn_nodes = set(nodes)
         self._drawn_passes = service.passes
+
+    def _paste_nametag(self):
+        """Put the nametag in the top right pane. Decoding the PNG takes ~375
+        ms, so it is decoded once and its pixels kept in a small framebuffer
+        (black/white, like the image), then blitted on later redraws."""
+        w, h = display_width - _RIGHT_X, _SPLIT_Y - _TOP
+        if self._nametag is not None:
+            display.black.blit(self._nametag, _RIGHT_X, _TOP)
+            return
+        try:
+            # Small image: no forced collections, they would overrun the gap.
+            display.draw_png(_NAMETAG, _TOP, _RIGHT_X, collect=False)
+        except OSError:
+            print("ranging: %s missing, run scripts/make_nametag.py" % _NAMETAG)
+            return
+        buf = bytearray((w + 7) // 8 * h)
+        fb = framebuf.FrameBuffer(buf, w, h, framebuf.MONO_HLSB)
+        fb.blit(display.black, -_RIGHT_X, -_TOP)
+        self._nametag = fb
 
     def _draw_list(self, scr, rows, n_nodes):
         _label(scr, _PAD, _TOP + 12, _TITLE, _TITLE_FONT)

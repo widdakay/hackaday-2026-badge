@@ -45,6 +45,18 @@ EPD_CS1_PIN = Pin(13, mode=Pin.OUT)
 EPD_CS2_PIN = Pin(3, mode=Pin.OUT)
 EPD_BUSY1_PIN = Pin(12, mode=Pin.IN)
 EPD_BUSY2_PIN = Pin(8, mode=Pin.IN)
+
+# Longest the panel may hold BUSY low (= busy). Every wait on BUSY used to be
+# unbounded, so a panel that never reported ready froze the display task for
+# good: the screen stopped changing and nothing raised. Now a wait raises
+# PanelTimeout and EPaperDisplay.run() recovers (see _recover()).
+BUSY_READY_TIMEOUT_MS = 10_000      # booster ready, shutdown, power-off
+BUSY_WAVEFORM_TIMEOUT_MS = 45_000   # one waveform; the slow one is ~35 s
+RECOVER_RETRY_MS = 2000             # wait before retrying the frame that failed
+
+
+class PanelTimeout(Exception):
+    pass
 EPD_DC_PIN = Pin(10, mode=Pin.OUT)  # Data High Command Low
 EPD_RST_PIN = Pin(11, mode=Pin.OUT)
 EPD_SCL_PIN = Pin(21, mode=Pin.OUT)
@@ -477,32 +489,48 @@ class EPaperDisplay:
                 self.black.pixel((col + img_c), (row + img_r), int(black))
                 self.red.pixel((col + img_c), (row + img_r), int(red))
 
-    def draw_png(self, filename: str, row: int = 0, col: int = 0):
-
-        gc.collect()
+    def draw_png(self, filename: str, row: int = 0, col: int = 0, collect: bool = True):
+        """collect=False skips the garbage collections around the decode
+        (~330 ms each, everything stops): fine for small images, which the
+        grown heap (lib/heap.py) has room for."""
+        if collect:
+            gc.collect()
         print(f"Loading {filename} This will take a while... {time.time()}")
         show_png(filename, self._framebuffer_black, self._framebuffer_red, row, col)
         print("Done loading png")
-        gc.collect()
+        if collect:
+            gc.collect()
 
     async def run(self):
         while True:
-            if self._framebuffer_ready.is_set():
-                # Clear before refreshing, not after: an update() queued while
-                # this refresh runs must start a new request, not be dropped.
-                self._framebuffer_ready.clear()
-                await self.refresh_now(fast=self._fast_requested, passes=self._passes_requested,
-                                       differential=self._diff_requested,
-                                       flash=self._flash_requested,
-                                       rows=self._partial_rows)
-            elif (
-                self._session_mode is not None
-                and time.ticks_diff(time.ticks_ms(), self._session_last_ms)
-                > KEEP_POWERED_IDLE_MS
-            ):
-                self._display_updated.clear()
-                await self.close_session(reason=f"idle {KEEP_POWERED_IDLE_MS} ms")
-                self._display_updated.set()
+            refreshing = False
+            try:
+                if self._framebuffer_ready.is_set():
+                    # Clear before refreshing, not after: an update() queued while
+                    # this refresh runs must start a new request, not be dropped.
+                    self._framebuffer_ready.clear()
+                    refreshing = True
+                    await self.refresh_now(fast=self._fast_requested, passes=self._passes_requested,
+                                           differential=self._diff_requested,
+                                           flash=self._flash_requested,
+                                           rows=self._partial_rows)
+                elif (
+                    self._session_mode is not None
+                    and time.ticks_diff(time.ticks_ms(), self._session_last_ms)
+                    > KEEP_POWERED_IDLE_MS
+                ):
+                    self._display_updated.clear()
+                    await self.close_session(reason=f"idle {KEEP_POWERED_IDLE_MS} ms")
+                    self._display_updated.set()
+            except Exception as ex:
+                # A panel timeout (or anything else) must not end this task:
+                # that is what froze the screen. The frame that failed is
+                # requested again, so it is retried after the recovery.
+                from lib import log as _log
+                _log.error("display: refresh failed, recovering", ex)
+                if refreshing:
+                    self._framebuffer_ready.set()
+                await self._recover(ex)
             await aio.sleep_ms(100)
 
     async def refresh_now(self, fast: bool = False, passes: int | None = None,
@@ -533,7 +561,9 @@ class EPaperDisplay:
         )
         self._halves_valid = True
         self._halves_reversed = self._reverse_fb_bits
-        gc.collect()
+        # No gc.collect() here: with the heap grown at boot (lib/heap.py) the
+        # automatic collector runs rarely, and a forced one stops everything,
+        # the LED animation included, for ~330 ms on every frame.
         self._display_updated.set()
         log.total()
 
@@ -569,7 +599,9 @@ class EPaperDisplay:
         await self.global_update(new_l, old_l, new_r, old_r, log=log, differential=True, rows=rows)
         self._halves = [new_l, new_r, old_l, old_r]
         self._halves_reversed = self._reverse_fb_bits
-        gc.collect()
+        # No gc.collect() here: with the heap grown at boot (lib/heap.py) the
+        # automatic collector runs rarely, and a forced one stops everything,
+        # the LED animation included, for ~330 ms on every frame.
         self._display_updated.set()
         log.total()
 
@@ -780,8 +812,7 @@ class EPaperDisplay:
         """
         self._send_index_data(0x09, [0x7F, 0x7D, 0x00])
         await aio.sleep_ms(200)
-        while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
-            await aio.sleep_ms(1)
+        await self._wait_ready("COG power-off", BUSY_READY_TIMEOUT_MS, 1)
         EPD_DC_PIN.value(False)
         EPD_CS1_PIN.value(False)
         await aio.sleep_ms(150)
@@ -833,6 +864,39 @@ class EPaperDisplay:
         self.spi.write(data)
         EPD_CS2_PIN.value(True)
 
+    async def _wait_ready(self, what: str, timeout_ms: int, poll_ms: int):
+        """Wait until both COGs release BUSY (high = ready), at most timeout_ms."""
+        start = time.ticks_ms()
+        while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
+            if time.ticks_diff(time.ticks_ms(), start) > timeout_ms:
+                raise PanelTimeout("%s: BUSY still low after %d ms (BUSY1=%d BUSY2=%d)" % (
+                    what, timeout_ms, EPD_BUSY1_PIN.value(), EPD_BUSY2_PIN.value()))
+            await aio.sleep_ms(poll_ms)
+
+    async def _recover(self, ex):
+        """The panel stopped answering: power it down without waiting on BUSY
+        and forget what it shows, so the next refresh starts from a hard reset
+        with one full slow refresh that cleans up whatever is on the film."""
+        print("EPD: recovering from", ex)
+        try:
+            self._send_index_data(0x09, [0x7F])
+            self._send_index_data(0x05, [0x7D])
+            self._send_index_data(0x09, [0x00])
+            await aio.sleep_ms(200)
+        except Exception:
+            pass
+        EPD_DC_PIN.value(False)
+        EPD_CS1_PIN.value(False)
+        EPD_RST_PIN.value(False)
+        EPD_CS1_PIN.value(True)
+        EPD_CS2_PIN.value(True)
+        self._session_mode = None
+        self._session_images = 0
+        self._halves_valid = False   # no differential refresh from an unknown frame
+        self._red_on_panel = True    # next fast refresh is promoted to the slow one
+        self._display_updated.set()  # apps waiting on is_done_updating() carry on
+        await aio.sleep_ms(RECOVER_RETRY_MS)
+
     async def _display_refresh(self, log=None, label: str = ""):
         """Wait for the booster to be ready, trigger an update, and wait for it to finish.
 
@@ -840,8 +904,7 @@ class EPaperDisplay:
         (driver B pulls the fast table three times): without it the next
         trigger, or the shutdown, could see BUSY still high and go early.
         """
-        while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
-            await aio.sleep_ms(10)
+        await self._wait_ready(label + "ready before trigger", BUSY_READY_TIMEOUT_MS, 10)
         if log:
             log.mark(label + "wait BUSY ready")
         self._send_index_data(0x15, [0x3C])
@@ -854,8 +917,7 @@ class EPaperDisplay:
         if log:
             log.mark(label + "0x15 trigger until BUSY low")
         # Waveform runs while BUSY is low. Poll finely so the timing is accurate.
-        while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
-            await aio.sleep_ms(10)
+        await self._wait_ready(label + "waveform", BUSY_WAVEFORM_TIMEOUT_MS, 10)
         if log:
             log.mark(label + "waveform (BUSY low)")
 
@@ -954,14 +1016,12 @@ class EPaperDisplay:
         Implemented after image data are uploaded to CoG
         Specific to mid-sized EPDs only
         """
-        while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
-            await aio.sleep_ms(100)
+        await self._wait_ready("ready before DC/DC shutdown", BUSY_READY_TIMEOUT_MS, 100)
         self._send_index_data(0x09, [0x7F])
         self._send_index_data(0x05, [0x7D])
         self._send_index_data(0x09, [0x00])
         await aio.sleep_ms(200)
-        while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
-            await aio.sleep_ms(100)
+        await self._wait_ready("DC/DC shutdown", BUSY_READY_TIMEOUT_MS, 100)
         EPD_DC_PIN.value(False)
         EPD_CS1_PIN.value(False)
         EPD_RST_PIN.value(False)

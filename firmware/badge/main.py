@@ -15,6 +15,8 @@ try:
     from lib.led_bar import leds
     import lib.json_configs as json_configs
     print("Importing apps...")
+    import lib.heap
+    log.info("heap grown: free=%d" % lib.heap.grow())
 except Exception as ex:
     # If anything goes wrong at import time, wait a second and print it
     # Sometimes these are hard to see, so the delay and extra print may help
@@ -29,6 +31,33 @@ except Exception as ex:
 # Log every 5th 60 s heartbeat: the last one before a crash says roughly when
 # it happened and how much memory was left.
 HEARTBEAT_LOG_EVERY = 5
+# A refresh takes 1-35 s. One still unfinished after this long is logged as
+# stuck: the BUSY waits in lib/epd.py have no timeout, so a panel that never
+# signals ready freezes the screen without raising anything.
+DISPLAY_STUCK_S = 60
+
+
+async def display_watch():
+    import lib.epd as epd
+    busy_since = None
+    reported = False
+    while True:
+        await aio.sleep(5)
+        if display.is_done_updating():
+            if reported:
+                log.info("display: refresh finished after %d s" % (
+                    time.ticks_diff(time.ticks_ms(), busy_since) // 1000))
+            busy_since = None
+            reported = False
+            continue
+        if busy_since is None:
+            busy_since = time.ticks_ms()
+        elif not reported and time.ticks_diff(time.ticks_ms(), busy_since) > DISPLAY_STUCK_S * 1000:
+            reported = True
+            app = "menu" if switcher.selecting_mode else switcher.apps[switcher.active_idx].name
+            log.info("ERROR display: refresh stuck > %d s, BUSY1=%d BUSY2=%d session=%s app=%s %s" % (
+                DISPLAY_STUCK_S, epd.EPD_BUSY1_PIN.value(), epd.EPD_BUSY2_PIN.value(),
+                getattr(display, "_session_mode", "?"), app, log.mem()))
 
 
 async def main():
@@ -72,6 +101,7 @@ async def main():
         _battery_task = aio.create_task(battery_monitor(app_bar.refresh))
     except Exception as ex:
         print("Battery monitor not started:", ex)
+    _display_watch_task = aio.create_task(display_watch())
 
     print("Running main loop...")
     log.info("running " + log.mem())
