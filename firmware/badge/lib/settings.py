@@ -4,7 +4,9 @@
 
 `name` is drawn on the nametags (lib/name_render.py) and broadcast by the
 ranging service, at most 16 bytes. Edit the file on the badge and reset: no
-firmware rebuild needed. Without a name, both use badge-XXXXXX from the MAC.
+firmware rebuild needed. Without a name there, the name typed into the stock
+Nametag app (its set_text("...") lines in /apps/nametag.py) is used, and
+failing that badge-XXXXXX from the MAC.
 Optional: "initiator_bias_m", see lib/ranging.py.
 """
 
@@ -22,8 +24,36 @@ def load():
         return {}
 
 
+def nametag_app_name():
+    """The name on a stock Hack-a-Day badge: the non-empty strings in the
+    Nametag app's set_text("...") calls, joined with spaces. None if unset."""
+    try:
+        with open("/apps/nametag.py") as f:
+            src = f.read()
+    except OSError:
+        return None
+    parts = []
+    i = 0
+    while True:
+        i = src.find("set_text(", i)
+        if i < 0:
+            break
+        i += 9
+        q = src[i:i + 1]
+        if q not in ("'", '"'):
+            continue
+        j = src.find(q, i + 1)
+        if j < 0:
+            break
+        text = src[i + 1:j].strip()
+        if text:
+            parts.append(text)
+        i = j + 1
+    return " ".join(parts) or None
+
+
 def badge_name(default):
-    name = load().get("name")
+    name = load().get("name") or nametag_app_name()
     if not name:
         return default
     raw = name.encode()[:NAME_MAX_BYTES]

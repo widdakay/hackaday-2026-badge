@@ -50,8 +50,20 @@ import time
 import lvgl
 
 from apps.base_app import BaseApp
-from lib import app_bar, graph_layout, log, name_render
+from lib import graph_layout, log, name_render
 from lib.epd import display, display_height, display_width
+
+# Runs on the stock Hack-a-Day badge files too (scripts/install_ranging.py
+# adds only this app's files): no app bar there, and the stock display driver
+# has no kept-open session or differential refresh, only a full refresh with
+# no arguments, so frames are spaced out instead (STOCK_FRAME_MS).
+try:
+    from lib import app_bar
+    _BAR_H = app_bar.HEIGHT
+except ImportError:
+    _BAR_H = 0
+_LIVE = hasattr(display, "keep_powered")
+STOCK_FRAME_MS = 30000       # stock driver: at most one (full) refresh this often
 from lib.led_bar import NUM_LEDS, leds
 from lib.ranging import CHANNEL, service
 
@@ -73,7 +85,7 @@ CLEAN_EVERY = 8             # live frames between balanced-flash cleans
 _TITLE = "I've found"        # on-screen title; the app itself is still "Ranging"
 
 # Panes, below the app bar. The dividers are 4 px black bars.
-_TOP = app_bar.HEIGHT
+_TOP = _BAR_H
 _SPLIT_X = 478              # vertical divider x 478..481
 _SPLIT_Y = 298              # horizontal divider y 298..301 (right side only)
 _RIGHT_X = _SPLIT_X + 4
@@ -138,6 +150,13 @@ _QR_SCALE = 2               # 2x2 panel pixels per module
 _QR_SIZE = _QR_N * _QR_SCALE
 _QR_X = _PAD
 _QR_Y = display_height - _QR_SIZE - 10
+
+
+def _update(**kwargs):
+    if _LIVE:
+        display.update(**kwargs)
+    else:
+        display.update()
 
 
 def _label(parent, x, y, text, font, color=_FG, w=None):
@@ -233,7 +252,8 @@ class RangingApp(BaseApp):
             # Keep the booster up between frames: skips ~2.5 s of reset, init and
             # power-up per frame. The driver closes the session after 60 s idle
             # or on a slow (red) refresh from another app.
-            display.keep_powered = True
+            if _LIVE:
+                display.keep_powered = True
             self._drawn_layout = None  # first frame is always a plain one
             self._pending = False
             self._snap = None
@@ -243,7 +263,8 @@ class RangingApp(BaseApp):
         if not display.is_done_updating():
             self._drawn_ms = time.ticks_ms()  # gap counts from the end of a frame
             return
-        if time.ticks_diff(time.ticks_ms(), self._drawn_ms) < MIN_GAP_MS:
+        gap = MIN_GAP_MS if _LIVE else STOCK_FRAME_MS
+        if time.ticks_diff(time.ticks_ms(), self._drawn_ms) < gap:
             return
         # One frame per full pass over the peer list, so every number on screen
         # is from the same pass; at once when the nodes shown change.
@@ -296,7 +317,7 @@ class RangingApp(BaseApp):
                 # until it has gone to the panel.
                 if dark >= _SEND_BUDGET_MS or time.ticks_diff(now, self._send_ms) > _DRAW_MAX_WAIT_MS:
                     kwargs, self._send = self._send, None
-                    display.update(**kwargs)
+                    _update(**kwargs)
                     self._drawn_ms = time.ticks_ms()
                 return
             late = self._pending and time.ticks_diff(now, self._pending_ms) > _DRAW_MAX_WAIT_MS
@@ -419,7 +440,7 @@ class RangingApp(BaseApp):
             kwargs = {"fast": True, "differential": True}
             self._live_frames += 1
         if send:
-            display.update(**kwargs)
+            _update(**kwargs)
         else:
             self._send = kwargs
             self._send_ms = time.ticks_ms()
@@ -440,7 +461,10 @@ class RangingApp(BaseApp):
             return
         try:
             # Small image: no forced collections, they would overrun the gap.
-            display.draw_png(_NAMETAG, _TOP, _RIGHT_X, collect=False)
+            if _LIVE:
+                display.draw_png(_NAMETAG, _TOP, _RIGHT_X, collect=False)
+            else:
+                display.draw_png(_NAMETAG, _TOP, _RIGHT_X)
             name_render.draw_name(display, _RIGHT_X + 30, _TOP + _TAG_HEADER + 15,
                                   display_width - 30, _SPLIT_Y - _TAG_FOOTER - 15, size=120)
         except OSError as ex:
