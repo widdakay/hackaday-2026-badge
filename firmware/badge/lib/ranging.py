@@ -7,9 +7,9 @@ and C3 nodes discover and range each other:
   * an ESP-NOW beacon every second with this badge's name (lib.settings), sent
     on the AP interface, so the sender MAC is the AP MAC the responder answers on
   * a ranging loop over every node heard in the last PEER_TIMEOUT_MS
-  * no retransmission: a badge does not broadcast its own results or relay
-    names. It still collects the results ftm_node boards broadcast (RDIST),
-    so their pairs appear in the map alongside this badge's own.
+  * a RANGE broadcast after every own FTM session, like the ftm_node boards,
+    and it collects everyone else's (RDIST), so pairs between other devices
+    appear in the map alongside this badge's own. Names are not relayed.
   * a SYNC broadcast of the firefly LED oscillator (lib.firefly) every
     firefly.SYNC_MS; badges only, the C3 nodes ignore it
 
@@ -378,6 +378,13 @@ class RangingService:
             return  # late result from a cancelled session
         r = (status, entries, peer.rssi, dist_cm, rtt_raw, rtt_est, med, mean, lo, hi)
         self._record("DIST", self.mac, peer.mac, r)
+        # Broadcast the result like the ftm_node boards do, so every device
+        # nearby gets this pair for its map. Raw values: receivers apply the
+        # initiator bias themselves, by this badge's name.
+        rssi = max(-128, min(127, peer.rssi))
+        self._send(struct.pack(
+            _RANGE_FMT, _MAGIC, _VERSION, _RANGE, peer.mac, status, entries, rssi,
+            dist_cm, rtt_raw, rtt_est, med, mean, lo, hi), "range")
 
     async def _sync_task(self):
         """Broadcast the firefly phase and retune toward the badges nearby."""
