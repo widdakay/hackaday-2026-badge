@@ -202,7 +202,9 @@ def _build_lutb_diff() -> bytes:
     carries the same counts here, and with on = off = 1, repeat = 1 a group
     plays its level byte literally, one frame per phase: 4 frames. A group
     cannot be shorter (a zero group runs ~4 s), so 10 groups = 40 frames =
-    1.18 s is the shortest pass possible.
+    1.18 s is the shortest pass possible. Tested: the rest groups cannot be
+    skipped either; repeat = 0 or all counts = 0 there leaves BUSY low for
+    over 45 s (0 seems to count as 256).
 
         g0      shake: VDL VDH VDL VDH (or mirrored). Balanced.
         g1-g6   VDH GND VDH GND (or VDL GND ...): 12 drive frames, 354 ms
@@ -345,6 +347,8 @@ class EPaperDisplay:
         self._halves_reversed = False
         # Top rows to refresh for the pending update; None = whole panel.
         self._partial_rows = None
+        # Row band (y0, y1) for a windowed differential refresh; None = off.
+        self._window_requested = None
         # Called by update() just before a frame is handed to the panel, to draw
         # overlays on top of every app (lib.app_bar installs the app bar here).
         self.before_update = None
@@ -414,7 +418,8 @@ class EPaperDisplay:
         disp.flush_ready()
 
     def update(self, fast: bool = False, passes: int | None = None,
-               differential: bool = False, flash: bool = False, rows: int | None = None):
+               differential: bool = False, flash: bool = False, rows: int | None = None,
+               window: tuple | None = None):
         """Done updating the framebuffer, update the display with the contents
 
         fast=True uses the short waveform from data/rendered_luts.py: about 3.3 s
@@ -446,6 +451,14 @@ class EPaperDisplay:
         the Ranging app's live frames: the differential table in the kept-open
         session when the previous frame is known, else a fast refresh. A full
         update queued alongside a partial one wins.
+
+        window=(y0, y1) (driver B): differential refresh with the panel's
+        refresh window (0x90 DRFW) limited to rows y0..y1-1, whatever
+        PARTIAL_REFRESH_WINDOW says. The waveform pass only scans those rows,
+        so it is much shorter than a full one; the caller opts in knowing
+        the window has left faint copies on at least one badge. Only pixels
+        that changed are driven. Falls back to a normal update if the previous
+        frame is not known. Queued windows merge into one band.
         """
         if self.before_update is not None:
             try:
@@ -463,12 +476,25 @@ class EPaperDisplay:
                 self._partial_rows = None
             else:
                 self._partial_rows = max(self._partial_rows, rows)
+            # A windowed frame merged with a partial one (the app bar's rows=N
+            # from the battery monitor, say) stays windowed, over both bands:
+            # otherwise the merge falls back to a full, possibly slow, refresh.
+            w = self._window_requested
+            if w is not None and window is None and rows is not None:
+                window = (0, rows)
+            elif window is not None and w is None and self._partial_rows is not None:
+                w = (0, self._partial_rows)
+            if window is None or w is None:
+                self._window_requested = None
+            else:
+                self._window_requested = (min(w[0], window[0]), max(w[1], window[1]))
         else:
             self._fast_requested = fast
             self._passes_requested = want
             self._diff_requested = differential
             self._flash_requested = flash
             self._partial_rows = rows
+            self._window_requested = window
         self._framebuffer_ready.set()
 
     def clear(self):
@@ -513,7 +539,8 @@ class EPaperDisplay:
                     await self.refresh_now(fast=self._fast_requested, passes=self._passes_requested,
                                            differential=self._diff_requested,
                                            flash=self._flash_requested,
-                                           rows=self._partial_rows)
+                                           rows=self._partial_rows,
+                                           window=self._window_requested)
                 elif (
                     self._session_mode is not None
                     and time.ticks_diff(time.ticks_ms(), self._session_last_ms)
@@ -531,14 +558,22 @@ class EPaperDisplay:
                 if refreshing:
                     self._framebuffer_ready.set()
                 await self._recover(ex)
-            await aio.sleep_ms(100)
+            # Wake as soon as a frame is queued (not on a 100 ms poll), so
+            # back-to-back frames follow each other without a gap.
+            try:
+                await aio.wait_for_ms(self._framebuffer_ready.wait(), 100)
+            except aio.TimeoutError:
+                pass
 
     async def refresh_now(self, fast: bool = False, passes: int | None = None,
                           differential: bool = False, flash: bool = False,
-                          rows: int | None = None):
+                          rows: int | None = None, window: tuple | None = None):
         """Split the framebuffers into halves and refresh the panel once."""
         if self._halves is None:
             self._halves = [bytearray(half_frame_one_color_size) for _ in range(4)]
+        if window is not None and self._driver_b and self._halves_valid:
+            await self._refresh_differential(False, window=window)
+            return
         partial = rows is not None and 0 < rows < display_height
         if partial and self._driver_b and self._halves_valid:
             # Red elsewhere on the film doesn't matter: only the strip is driven.
@@ -567,7 +602,8 @@ class EPaperDisplay:
         self._display_updated.set()
         log.total()
 
-    async def _refresh_differential(self, flash: bool, rows: int | None = None):
+    async def _refresh_differential(self, flash: bool, rows: int | None = None,
+                                    window: tuple | None = None):
         """Refresh with the previous frame in the red plane (see update()).
 
         The black halves still hold the frame last sent (bit-reversed on
@@ -596,7 +632,8 @@ class EPaperDisplay:
             old_l, old_r, new_l, new_r = new_l, new_r, old_l, old_r
             _split_halves(self._framebuffer_black, new_l, new_r)
             log.mark("flash: inverted frame done, now the real one")
-        await self.global_update(new_l, old_l, new_r, old_r, log=log, differential=True, rows=rows)
+        await self.global_update(new_l, old_l, new_r, old_r, log=log, differential=True,
+                                 rows=rows, window=window)
         self._halves = [new_l, new_r, old_l, old_r]
         self._halves_reversed = self._reverse_fb_bits
         # No gc.collect() here: with the heap grown at boot (lib/heap.py) the
@@ -616,10 +653,12 @@ class EPaperDisplay:
         passes: int | None = None,
         differential: bool = False,
         rows: int | None = None,
+        window: tuple | None = None,
     ):
         """Push both halves to the panel and refresh.
 
         rows=N: partial refresh of the top N rows (see update()).
+        window=(y0, y1): partial refresh of rows y0..y1-1 (see update()).
 
         The half-frame buffers are modified in place (bit reversal, red folding),
         so pass copies, as run() does.
@@ -627,14 +666,25 @@ class EPaperDisplay:
         if log is None:
             log = _StageLog()
         n = half_frame_one_color_size
-        partial = rows is not None
+        if window is None and rows is not None:
+            window = (0, rows)
+        partial = window is not None
         if partial:
             fast = True
         # DRFW's y counts 4-row groups and its end reads one past the last group
         # (full screen: 672 / 4 + 1 = 0xA9), the same rule as PDi's 5.81", 7.41"
         # and 11.98" drivers. Measured: a 40-row window runs each waveform pass
         # in ~95 ms instead of ~1157 ms, and leaves the rest of the panel alone.
-        drfw_y_end = (rows + 3) // 4 + 1 if partial else 0xA9
+        # Measured: the waveform time follows the window's end only (rows
+        # 236-475 ran 843 ms, as long as 0-475 would), so the scan always
+        # starts at the top and a fast band belongs near the top of the panel.
+        # The start is still sent, one group early so the band surely fits.
+        if partial:
+            y0, y1 = max(0, window[0]), min(display_height, window[1])
+            drfw_y_start = max(0, y0 // 4 - 1)
+            drfw_y_end = (y1 + 3) // 4 + 1
+        else:
+            drfw_y_start, drfw_y_end = 0x00, 0xA9
         if differential:
             # The red planes carry the previous frame, not red: no folding, no
             # red scan, one pass of the differential table.
@@ -662,7 +712,7 @@ class EPaperDisplay:
 
         mode = "diff" if differential else ("fast" if use_lut else "slow")
         print(f"Updating display to new image ({mode}, driver {'B' if self._driver_b else '8'}"
-              f"{', rows 0-%d' % (rows - 1) if partial else ''})")
+              f"{', rows %d-%d' % (window[0], window[1] - 1) if partial else ''})")
 
         # Kept-open session: the panel latches one waveform per session, so a
         # mode change has to close it first (rewriting 0xB0 in an open session
@@ -677,7 +727,8 @@ class EPaperDisplay:
 
         if self._session_mode == mode:
             # Warm: booster is still up and the waveform is still latched.
-            self._send_images(black_left, red_left, black_right, red_right, log, drfw_y_end)
+            self._send_images(black_left, red_left, black_right, red_right, log,
+                              drfw_y_end, drfw_y_start)
             await self._trigger(use_lut, log, passes)
             self._session_images += 1
             self._session_last_ms = time.ticks_ms()
@@ -689,7 +740,8 @@ class EPaperDisplay:
         log.mark("hard reset")
         if self._driver_b and B1_SEND_BOOSTER_CONFIG:
             self._send_index_data(0x70, [0x71, 0x36])  # booster config, both COGs
-        self._send_images(black_left, red_left, black_right, red_right, log, drfw_y_end)
+        self._send_images(black_left, red_left, black_right, red_right, log,
+                              drfw_y_end, drfw_y_start)
 
         await self.cog_initial()
         log.mark("COG init register sequence")
@@ -942,6 +994,7 @@ class EPaperDisplay:
         red_right: bytearray | bytes | memoryview[int],
         log=None,
         drfw_y_end: int = 0xA9,
+        drfw_y_start: int = 0x00,
     ):
         assert len(black_left) == half_frame_one_color_size
         assert len(red_left) == half_frame_one_color_size
@@ -963,7 +1016,7 @@ class EPaperDisplay:
         # DUW for both left and right halves
         self._send_index_data(0x13, [0x00, 0x3B, 0x00, 0x00, 0x9F, 0x02])
         # DRFW for Both left and right halves
-        self._send_index_data(0x90, [0x00, 0x3B, 0x00, drfw_y_end])
+        self._send_index_data(0x90, [0x00, 0x3B, drfw_y_start, drfw_y_end])
         ram_rw_data = [0x3B, 0x00, 0x14]
         self._send_index_data_left(0x12, ram_rw_data)  # RAM_RW for left half
         self._send_index_data_left(0x10, black_left)  # Black frame for left half
