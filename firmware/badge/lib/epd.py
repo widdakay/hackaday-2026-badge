@@ -91,13 +91,30 @@ def reverse_byte(byte: int) -> int:
 # its nominal 8 MHz. 4 MHz is the plane-transfer rate the iTC97 driver reference
 # validates; set USE_HW_SPI = False to fall back to SoftSPI if anything misbehaves.
 USE_HW_SPI = True
-EPD_SPI_BAUD = 4_000_000
+# 20 MHz is PDi's maximum for this CoG family and what supercon26-badge-os runs
+# on the same badge (4 full planes then take ~130 ms instead of ~650 ms).
+EPD_SPI_BAUD = 20_000_000
 
 # Driver B (E2969JS0B1) only: the iTC97 reference (errata 9) says a B1 that never
-# receives 0x70 <- 71, 36 draws about 2 A during refresh. The original PDI port
-# never sent it, so it is off by default to keep the slow path unchanged.
-# Measure supply current before and after enabling it.
-B1_SEND_BOOSTER_CONFIG = False
+# receives 0x70 <- 71, 36 draws about 2 A during refresh. supercon26-badge-os
+# sends it after every reset, with the short waveforms below.
+B1_SEND_BOOSTER_CONFIG = True
+
+# Differential table layout (see _build_lutb_diff). True: one frame per group
+# (phase c only), 10 frames = ~0.24 s per full-height pass, the table
+# supercon26-badge-os uses for its calm partial updates. False: the older
+# 4-frames-per-group table, 40 frames = ~1.18 s, with a shake and chopped drive.
+DIFF_ONE_FRAME_GROUPS = False
+# Frames of VDH / VDL a changed pixel gets in the one-frame table (1..9; the
+# last of the 10 frames is always GND).
+DIFF_DRIVE_FRAMES = 9
+# A windowed refresh scans at least this many rows: a frame lasts as long as its
+# scan, so this bounds the least drive a change gets (~105 ms of VDH/VDL).
+WINDOW_MIN_ROWS = 336
+# Session opens for the short waveforms use the quick waits from
+# supercon26-badge-os (~0.35 s instead of ~2.4 s). The slow (OTP) waveform
+# always gets the PDi reference waits.
+QUICK_OPEN = True
 
 # Print a timed line for every refresh stage to the serial console.
 EPD_TIMING_LOG = True
@@ -120,8 +137,9 @@ FAST_PASSES = 3
 PARTIAL_REFRESH_WINDOW = False
 # Close the session after this long without a refresh.
 KEEP_POWERED_IDLE_MS = 60_000
-# The reference tears the session down every 20 images regardless.
-SESSION_MAX_IMAGES = 20
+# Reopen the session after this many images. The iTC97 reference uses 20;
+# supercon26-badge-os has proven 60 on this panel.
+SESSION_MAX_IMAGES = 60
 
 # Lookup table replacing the per-byte reverse_byte() generator.
 _REVERSE_TABLE = bytes(reverse_byte(i) for i in range(256))
@@ -216,6 +234,8 @@ def _build_lutb_diff() -> bytes:
     instead gives every static paper pixel -16 and every static ink pixel +8
     frames per pass, which is what leaves red ghosts.
     """
+    if DIFF_ONE_FRAME_GROUPS:
+        return _build_lutb_diff_short()
     shake = {1: 0x99, 2: 0x66}   # VDL VDH VDL VDH / VDH VDL VDH VDL
     drive = {1: 0x44, 2: 0x88}   # VDH GND VDH GND / VDL GND VDL GND
     out = bytearray()
@@ -229,6 +249,37 @@ def _build_lutb_diff() -> bytes:
                 level = 0x00
             # level, (on, off, ph2) x 2, repeat. Same counts in every table.
             out += bytes((level, 1, 1, 1, 1, 1, 1, 1))
+    return bytes(out)
+
+
+def _build_lutb_diff_short() -> bytes:
+    """One-frame-per-group differential table (supercon26-badge-os part_table).
+
+    Same transitions as _build_lutb_diff (previous frame in the red plane,
+    table = (old << 1) | new), but every group is
+
+        level, TPa 1, TPb 1, SRab 0, TPc 1, TPd 0, SRcd 1, RP 1
+
+    so phases a/b are skipped and phase c plays one frame: 10 groups = 10
+    frames, ~237 ms at full height (the doc comment above found 4 frames per
+    group with all counts at 1). The level sits in phase c (bits 3-2).
+
+        table 1 (white -> black): VDH for DIFF_DRIVE_FRAMES frames, then GND
+        table 2 (black -> white): VDL for DIFF_DRIVE_FRAMES frames, then GND
+        tables 0, 3, 4:           GND
+
+    DC: +N frames on turning black, -N on turning white, so it stays bounded
+    as with the long table. Ink comes out dark red and erased ink leaves a
+    light ghost; a flash or a fast full refresh cleans up.
+
+    Measured by supercon26-badge-os: zero in a whole half, RP 0,
+    SRab = SRcd = 0, and SRcd 0 alone all hang the CoG (BUSY stuck low).
+    """
+    drive = max(1, min(9, DIFF_DRIVE_FRAMES))  # the last frame must be GND
+    out = bytearray(bytes((0x00, 1, 1, 0, 1, 0, 1, 1)) * 50)
+    for f in range(drive):
+        out[(10 + f) * 8] = 1 << 2  # table 1, group f: VDH in phase c
+        out[(20 + f) * 8] = 2 << 2  # table 2, group f: VDL in phase c
     return bytes(out)
 
 
@@ -439,7 +490,8 @@ class EPaperDisplay:
         differential=True (driver B, fast): one pass of the differential table
         (_build_lutb_diff): only pixels that changed since the last frame are
         driven, with a DC-balanced drive, so static content gets no charge and
-        nothing builds up. 1.18 s of waveform. flash=True first sends the
+        nothing builds up. ~0.24 s of waveform (1.18 s with
+        DIFF_ONE_FRAME_GROUPS = False). flash=True first sends the
         inverted frame and then the real one: every pixel gets an equal push
         both ways and ends firmly at its rail, the balanced way to wipe the
         light ghosts single passes leave. Falls back to a normal fast refresh
@@ -452,11 +504,12 @@ class EPaperDisplay:
         session when the previous frame is known, else a fast refresh. A full
         update queued alongside a partial one wins.
 
-        window=(y0, y1) (driver B): differential refresh with the panel's
-        refresh window (0x90 DRFW) limited to rows y0..y1-1, whatever
-        PARTIAL_REFRESH_WINDOW says. The waveform pass only scans those rows,
-        so it is much shorter than a full one; the caller opts in knowing
-        the window has left faint copies on at least one badge. Only pixels
+        window=(y0, y1) (driver B): differential refresh that scans only a
+        band of rows around y0..y1-1 (DUW start + DRFW end, see _scan_band),
+        whatever PARTIAL_REFRESH_WINDOW says. The band is widened to at least
+        WINDOW_MIN_ROWS and until a + b + 1 >= 680, which avoids the faint
+        copies a DRFW end alone left; a band in the lower half scans ~336 rows
+        (~0.13 s), one that reaches the top scans the whole panel. Only pixels
         that changed are driven. Falls back to a normal update if the previous
         frame is not known. Queued windows merge into one band.
         """
@@ -671,20 +724,16 @@ class EPaperDisplay:
         partial = window is not None
         if partial:
             fast = True
-        # DRFW's y counts 4-row groups and its end reads one past the last group
-        # (full screen: 672 / 4 + 1 = 0xA9), the same rule as PDi's 5.81", 7.41"
-        # and 11.98" drivers. Measured: a 40-row window runs each waveform pass
-        # in ~95 ms instead of ~1157 ms, and leaves the rest of the panel alone.
-        # Measured: the waveform time follows the window's end only (rows
-        # 236-475 ran 843 ms, as long as 0-475 would), so the scan always
-        # starts at the top and a fast band belongs near the top of the panel.
-        # The start is still sent, one group early so the band surely fits.
-        if partial:
-            y0, y1 = max(0, window[0]), min(display_height, window[1])
-            drfw_y_start = max(0, y0 // 4 - 1)
-            drfw_y_end = (y1 + 3) // 4 + 1
-        else:
-            drfw_y_start, drfw_y_end = 0x00, 0xA9
+        # Scan band (supercon26-badge-os part_start): the DUW (0x13) y range
+        # sent just before the trigger moves where the scan starts, DRFW (0x90)
+        # where it ends; rows outside are not driven. A DRFW end alone (the old
+        # way here) always scanned from the top and left faint copies of the
+        # band lower down: the band has to satisfy a + b + 1 >= 680 so the gate
+        # chain carries the last pulse past the panel's 680 gate lines before
+        # the next frame. It also spans at least WINDOW_MIN_ROWS rows for drive.
+        # Bands that cannot meet both get the whole panel, which includes any
+        # band touching the top rows (the app bar).
+        band = self._scan_band(window) if partial else None
         if differential:
             # The red planes carry the previous frame, not red: no folding, no
             # red scan, one pass of the differential table.
@@ -727,8 +776,8 @@ class EPaperDisplay:
 
         if self._session_mode == mode:
             # Warm: booster is still up and the waveform is still latched.
-            self._send_images(black_left, red_left, black_right, red_right, log,
-                              drfw_y_end, drfw_y_start)
+            self._send_images(black_left, red_left, black_right, red_right, log)
+            self._set_scan(band, log)
             await self._trigger(use_lut, log, passes)
             self._session_images += 1
             self._session_last_ms = time.ticks_ms()
@@ -736,15 +785,15 @@ class EPaperDisplay:
             log.mark(f"session kept open ({self._session_images} images)")
             return
 
-        await self._reset()
-        log.mark("hard reset")
+        quick = QUICK_OPEN and use_lut and self._driver_b
+        await self._reset(quick)
+        log.mark("hard reset" + (" (quick)" if quick else ""))
         if self._driver_b and B1_SEND_BOOSTER_CONFIG:
             self._send_index_data(0x70, [0x71, 0x36])  # booster config, both COGs
-        self._send_images(black_left, red_left, black_right, red_right, log,
-                              drfw_y_end, drfw_y_start)
+        self._send_images(black_left, red_left, black_right, red_right, log)
 
-        await self.cog_initial()
-        log.mark("COG init register sequence")
+        await self.cog_initial(quick)
+        log.mark("COG init register sequence" + (" (quick)" if quick else ""))
         if use_lut:
             # The only window for 0xB0: after the last waveform-load strobe in
             # cog_initial (which loads the OTP waveform into these registers) and
@@ -754,6 +803,7 @@ class EPaperDisplay:
             log.mark(f"write 0xB0 waveform ({len(lut)} B)")
         await self._dcdc_soft_start()
         log.mark("DC/DC soft start")
+        self._set_scan(band, log)
         await self._trigger(use_lut, log, passes)
         self._red_on_panel = red_after
         if self.keep_powered:
@@ -764,6 +814,32 @@ class EPaperDisplay:
         else:
             await self._dcdc_soft_shutdown()
             log.mark("DC/DC soft shutdown")
+
+    @staticmethod
+    def _scan_band(window: tuple):
+        """Rows (a, b) to scan for a refresh of rows window[0]..window[1]-1,
+        or None for the whole panel (see the band comment in global_update)."""
+        y0 = max(0, window[0])
+        y1 = min(display_height, window[1]) - 1
+        if y1 < y0:
+            return None
+        a = y0 & ~3
+        b = min(display_height - 1, max(y1, 679 - a, a + WINDOW_MIN_ROWS - 1) | 3)
+        a = min(a, (b - WINDOW_MIN_ROWS + 1) & ~3)
+        if a <= 0 or a + b + 1 < 680:
+            return None
+        return a, b
+
+    def _set_scan(self, band, log=None):
+        """DUW + DRFW for the scan, right before the trigger. band None = the
+        whole panel (and _send_images already left both at the whole panel)."""
+        if band is None:
+            return
+        a, b = band
+        self._send_index_data(0x13, [0x00, 0x3B, a & 0xFF, a >> 8, b & 0xFF, b >> 8])
+        self._send_index_data(0x90, [0x00, 0x3B, a >> 2, min(0xA9, (b >> 2) + 1)])
+        if log:
+            log.mark("scan band rows %d-%d" % (a, b))
 
     async def _trigger(self, use_lut: bool, log, passes: int | None = None):
         if use_lut and self._driver_b:
@@ -813,46 +889,50 @@ class EPaperDisplay:
         return self._fast_lut
 
 
-    async def cog_initial(self):
+    async def cog_initial(self, quick: bool = False):
+        """Register sequence. quick: supercon26-badge-os's waits (0x05 7D 50 ms,
+        0x05 00 1 ms, load strobes 2 / 10 ms): the open takes ~0.35 s and 0xB0
+        still latches. Only used with a 0xB0 table (see global_update)."""
+        off, on, hi, lo = (50, 1, 2, 10) if quick else (200, 10, 100, 100)
         self._send_index_data(0x05, [0x7D])
-        await aio.sleep_ms(200)
+        await aio.sleep_ms(off)
         self._send_index_data(0x05, [0x00])
-        await aio.sleep_ms(10)
+        await aio.sleep_ms(on)
         self._send_index_data(0xD8, [0x80])  # MS_SYNC)
         self._send_index_data(0xD6, [0x00])  # BVSS
         self._send_index_data(0xA7, [0x10])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(hi)
         self._send_index_data(0xA7, [0x00])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(lo)
         self._send_index_data(0x03, [0x00, 0x11])  # OSC
 
         # Display 1
         self._send_index_data_left(0x44, [0x00])
         self._send_index_data_left(0x45, [0x80])
         self._send_index_data_left(0xA7, [0x10])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(hi)
         self._send_index_data_left(0xA7, [0x00])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(lo)
         self._send_index_data_left(0x44, [0x06])
         self._send_index_data_left(0x45, [0x82])  # Temperature 0x82@25C
         self._send_index_data_left(0xA7, [0x10])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(hi)
         self._send_index_data_left(0xA7, [0x00])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(lo)
 
         # Display 2
         self._send_index_data_right(0x44, [0x00])
         self._send_index_data_right(0x45, [0x80])
         self._send_index_data_right(0xA7, [0x10])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(hi)
         self._send_index_data_right(0xA7, [0x00])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(lo)
         self._send_index_data_right(0x44, [0x06])
         self._send_index_data_right(0x45, [0x82])  # Temperature 0x82@25C
         self._send_index_data_right(0xA7, [0x10])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(hi)
         self._send_index_data_right(0xA7, [0x00])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(lo)
 
         self._send_index_data(0x60, [0x25])  # TCON
         self._send_index_data_left(0x61, [0x01])  # STV_DIR for Display 1
@@ -973,8 +1053,20 @@ class EPaperDisplay:
         if log:
             log.mark(label + "waveform (BUSY low)")
 
-    async def _reset(self):
-        """CoG driver power-on hard reset"""
+    async def _reset(self, quick: bool = False):
+        """CoG driver power-on hard reset. quick: the 2/4/20 ms waits of
+        supercon26-badge-os (PDi Wide_Large's for this CoG family)."""
+        if quick:
+            EPD_RST_PIN.value(True)
+            await aio.sleep_ms(2)
+            EPD_RST_PIN.value(False)
+            await aio.sleep_ms(4)
+            EPD_RST_PIN.value(True)
+            await aio.sleep_ms(20)
+            EPD_CS1_PIN.value(True)
+            EPD_CS2_PIN.value(True)
+            await aio.sleep_ms(5)
+            return
         await aio.sleep_ms(200)
         EPD_RST_PIN.value(True)
         await aio.sleep_ms(20)
