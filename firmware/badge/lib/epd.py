@@ -997,9 +997,13 @@ class EPaperDisplay:
         EPD_CS2_PIN.value(True)
 
     async def _wait_ready(self, what: str, timeout_ms: int, poll_ms: int):
-        """Wait until both COGs release BUSY (high = ready), at most timeout_ms."""
+        """Wait until a COG releases BUSY (high = ready), at most timeout_ms.
+
+        Either line going high counts, as in the stock driver: on some badges
+        BUSY2 stays low through the whole session, and waiting for both timed
+        out every refresh (PanelTimeout, BUSY1=1 BUSY2=0)."""
         start = time.ticks_ms()
-        while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
+        while not EPD_BUSY1_PIN.value() and not EPD_BUSY2_PIN.value():
             if time.ticks_diff(time.ticks_ms(), start) > timeout_ms:
                 raise PanelTimeout("%s: BUSY still low after %d ms (BUSY1=%d BUSY2=%d)" % (
                     what, timeout_ms, EPD_BUSY1_PIN.value(), EPD_BUSY2_PIN.value()))
