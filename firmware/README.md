@@ -13,6 +13,7 @@ python scripts/install_ranging.py
 * The name is in `/data/settings.json` on the badge, 16 bytes max.
 * `python scripts/update.py push --reset` copies all of `badge/` to the badge.
 * Crash log: `mpremote cp :data/log.txt .`
+* Protocol: [PROTOCOL.md](PROTOCOL.md)
 
 # Micropython
 Baseline micropython 1.27 (stock MicroPython, without the `ftm` module, so no Ranging)

@@ -11,7 +11,7 @@ The Ranging app measures distances between badges with Wi-Fi FTM (802.11mc). It 
 
 Ranging runs in the background when other apps are open. Also added: an app bar with a battery icon, faster display refresh, and button and app-switching fixes.
 
-Install: [firmware/README.md](firmware/README.md#installing)
+Install: [firmware/README.md](firmware/README.md#installing). Protocol: [firmware/PROTOCOL.md](firmware/PROTOCOL.md).
 
 # Badge Hardware
 The badge uses a 9.7 inch Pervasive Displays E2969JS0B1 electronic paper panel that was recycled from price tags which were destined for a now bankrupt German department store chain, coupled with an ESP32-S3 microcontroller.
