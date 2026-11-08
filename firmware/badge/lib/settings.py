@@ -7,7 +7,7 @@ ranging service, at most 16 bytes. Edit the file on the badge and reset: no
 firmware rebuild needed. Without a name there, the name typed into the stock
 Nametag app (its set_text("...") lines in /apps/nametag.py) is used, and
 failing that badge-XXXXXX from the MAC.
-Optional: "initiator_bias_m", see lib/ranging.py.
+Optional: "initiator_bias_m" and "ranging_channel", see lib/ranging.py.
 """
 
 import json

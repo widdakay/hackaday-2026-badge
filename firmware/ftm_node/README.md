@@ -6,7 +6,7 @@ and test ranging before it goes into the badge firmware.
 
 Every board runs the same firmware:
 
-- a hidden softAP on channel 6 with the FTM responder on
+- a hidden softAP on channel 1 (the badge os channel) with the FTM responder on
 - an ESP-NOW broadcast beacon every second, for discovery (no Wi-Fi scanning)
 - a loop that ranges each board heard in the last 10 s, in turn
 - an ESP-NOW broadcast of every result, so the board on USB also prints what

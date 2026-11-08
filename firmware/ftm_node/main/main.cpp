@@ -50,7 +50,7 @@
 namespace {
 
 // ---- Configuration --------------------------------------------------------
-constexpr uint8_t kChannel = 6;             // every node must share one channel
+constexpr uint8_t kChannel = 1;             // every node must share one channel; 1 = badge os
 constexpr uint8_t kFrameCount = 16;         // FTM frames per session (16/24/32/64)
 constexpr uint16_t kBurstPeriod = 0;        // FTM burst period, 100 ms units; 0 = no preference (fastest), 1 is rejected
 constexpr uint32_t kBeaconPeriodMs = 1000;

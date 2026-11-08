@@ -12,6 +12,10 @@ and C3 nodes discover and range each other:
     appear in the map alongside this badge's own. Names are not relayed.
   * a SYNC broadcast of the firefly LED oscillator (lib.firefly) every
     firefly.SYNC_MS; badges only, the C3 nodes ignore it
+  * the badge os protocol (github.com/yigitabi5444/supercon26-badge-os,
+    main/main.c "Ranging") alongside: BOSR and BOSF packets, so badges
+    running badge os and these badges find, range and map each other. See
+    firmware/PROTOCOL.md, "badge os compatibility".
 
 It prints the same serial lines as ftm_node (SELF, PEER, PEERS, LOST, DIST,
 RDIST), so firmware/ftm_node/tools/ftm_monitor.py works with a badge on USB.
@@ -32,12 +36,13 @@ import time
 
 import aioespnow
 import network
+import random
 
 import ftm
 
 from lib import firefly, log, settings
 
-CHANNEL = 6
+CHANNEL = 1                # badge os uses 1, fixed; "ranging_channel" in settings.json overrides
 FRAMES = 16                # smallest fixed count the driver accepts
 BURST_PERIOD = 0           # no preference: fastest (176 ms vs 316 ms at 2); 1 is rejected (ESP_ERR_INVALID_ARG)
 BEACON_MS = 1000
@@ -55,7 +60,9 @@ RESULT_TIMEOUT_MS = 30000  # ignore and drop measurements older than this
 # side is taken as unbiased. Override in data/settings.json, e.g.
 #   {"initiator_bias_m": {"badge": 1.9, "node": 0.0}}
 # and calibrate against a tape measure with ftm_node/tools/ftm_monitor.py.
-INITIATOR_BIAS_M = {"badge": 1.9, "node": 0.0}
+# "badgeos": badges running badge os. They send driver distances, the minimum
+# of their last 4, with no offset (they checked side by side), so 0.
+INITIATOR_BIAS_M = {"badge": 1.9, "node": 0.0, "badgeos": 0.0}
 MIN_DISTANCE_CM = 5        # corrected readings are clamped to at least this
 HISTORY = 3                # results kept per directed pair, for the median.
                            # Each pair gets one result per pass (one FTM session per
@@ -74,6 +81,27 @@ _SYNC_FMT = "<4sBBIHH"             # header, firefly cycles, phase (1/65536), pe
 _SYNC_LEN = struct.calcsize(_SYNC_FMT)
 _BROADCAST = b"\xff" * 6
 PS_TO_CM = 0.0149896229    # one-way cm per picosecond of round trip
+
+# badge os (supercon26-badge-os). No version byte; packed, little-endian.
+#   BOSR, ~1 s:   "BOSR", u8[6] sender's SoftAP MAC (where to aim FTM), u8 n,
+#                 n x (u8[6] mac, i16 cm) its own latest ranges (n <= 8),
+#                 then char[12] username, NUL-padded (absent before v0.7)
+#   BOSF, ~250 ms: "BOSF", u8 n, n x (u8[6] mac, i16 cm): the sessions it
+#                 finished since its last BOSF (n <= 16)
+# A badge os badge sends from its station interface: the ESP-NOW sender MAC
+# is its station MAC, which is also how it names badges in the (mac, cm)
+# pairs. Here every device is keyed by the MAC FTM is aimed at, so a badge os
+# badge is keyed by the SoftAP MAC from its BOSR, and its station MAC is
+# mapped onto that. These badges send BOSR and BOSF from the AP interface,
+# so to badge os they are a badge whose station and SoftAP MAC are the same.
+_BOSR = b"BOSR"
+_BOSF = b"BOSF"
+_BOS_PAIR = "<6sh"
+_BOS_PAIR_LEN = 8
+_BOSR_HEAD = 11                    # magic, ap, n
+_BOSR_MAX = 8                      # badge os v0.8 rejects more
+_BOSF_MAX = 16
+_BOS_NAME_LEN = 12
 
 
 def mac_str(mac):
@@ -122,6 +150,10 @@ class RangingService:
         self.latest_rtt = {}  # (from_mac, to_mac) -> (round trip ps, ticks_ms)
         self.updated_ms = 0   # last time any distance changed
         self.bias_cm = {k: v * 100 for k, v in INITIATOR_BIAS_M.items()}
+        self.channel = CHANNEL
+        self.bos_sta = {}     # ap_mac -> station mac, badges running badge os
+        self._bos_ap = {}     # station mac -> ap_mac, the reverse
+        self._bos_pending = []  # [(mac as badge os names it, cm)] for the next BOSF
         self._next_number = 1
         # Pass timing: how long one round over every live peer takes, so the
         # app can say how much time the median covers (HISTORY passes).
@@ -142,12 +174,17 @@ class RangingService:
         ap.active(True)
         self.mac = bytes(ap.config("mac"))
         self.name = settings.badge_name(None) or settings.default_name()
+        cfg = settings.load()
         bias = dict(INITIATOR_BIAS_M)
-        bias.update(settings.load().get("initiator_bias_m") or {})
+        bias.update(cfg.get("initiator_bias_m") or {})
         self.bias_cm = {k: float(v) * 100 for k, v in bias.items()}
+        try:
+            self.channel = int(cfg.get("ranging_channel") or CHANNEL)
+        except (TypeError, ValueError):
+            self.channel = CHANNEL
         self.numbers[self.mac] = 0
         self.names[self.mac] = self.name
-        ap.config(essid=self.name, channel=CHANNEL, hidden=True, authmode=network.AUTH_OPEN)
+        ap.config(essid=self.name, channel=self.channel, hidden=True, authmode=network.AUTH_OPEN)
         sta = network.WLAN(network.STA_IF)
         sta.active(True)
         try:
@@ -158,16 +195,23 @@ class RangingService:
 
         e = aioespnow.AIOESPNow()
         e.active(True)
-        e.add_peer(_BROADCAST, channel=CHANNEL, ifidx=network.AP_IF)
+        e.add_peer(_BROADCAST, channel=self.channel, ifidx=network.AP_IF)
         self._espnow = e
 
-        self._tasks = [aio.create_task(t()) for t in (self._beacon_task, self._rx_task, self._range_task, self._sync_task)]
+        self._tasks = [aio.create_task(t()) for t in (self._beacon_task, self._rx_task, self._range_task,
+                                                      self._sync_task, self._bos_task)]
         self.started = True
-        print("SELF,%s,%s,%d" % (mac_str(self.mac), self.name, CHANNEL))
+        print("SELF,%s,%s,%d" % (mac_str(self.mac), self.name, self.channel))
         log.info("ranging: started as %s %s" % (self.name, mac_str(self.mac)))
 
     def name_of(self, mac):
-        return self.names.get(mac) or mac_str(mac)[-8:]
+        name = self.names.get(mac)
+        if name:
+            return name
+        sta = self.bos_sta.get(mac)
+        if sta:  # badge os shows a badge without a username by its station MAC
+            return "%02X%02X" % (sta[4], sta[5])
+        return mac_str(mac)[-8:]
 
     def number_of(self, mac):
         """Stable display number: assigned the first time a node turns up and
@@ -239,6 +283,8 @@ class RangingService:
         'badge' for everything else, including this badge."""
         if mac == self.mac:
             return "badge"
+        if mac in self.bos_sta:
+            return "badgeos"
         return "node" if self.names.get(mac, "").startswith("node-") else "badge"
 
     def _fresh(self, frm, to):
@@ -312,7 +358,7 @@ class RangingService:
             seq += 1
             self._send(struct.pack(_BEACON_FMT, _MAGIC, _VERSION, _BEACON, seq, name), "beacon")
             if seq % 10 == 1:
-                print("SELF,%s,%s,%d" % (mac_str(self.mac), self.name, CHANNEL))
+                print("SELF,%s,%s,%d" % (mac_str(self.mac), self.name, self.channel))
                 now = time.ticks_ms()
                 for p in self.peers.values():
                     print("PEERS,%s,%s,%d,%d" % (mac_str(p.mac), self.name_of(p.mac), p.rssi,
@@ -324,6 +370,9 @@ class RangingService:
         while True:
             try:
                 mac, msg = await e.arecv()
+                if msg and msg[:4] in (_BOSR, _BOSF):
+                    self._bos_rx(bytes(mac), msg)
+                    continue
                 if not msg or len(msg) < 6 or msg[:4] != _MAGIC or msg[4] != _VERSION:
                     continue
                 mac = bytes(mac)
@@ -348,7 +397,7 @@ class RangingService:
 
     async def _range_one(self, peer):
         try:
-            ftm.start(peer.mac, CHANNEL, frames=FRAMES, burst=BURST_PERIOD)
+            ftm.start(peer.mac, self.channel, frames=FRAMES, burst=BURST_PERIOD)
         except OSError as ex:
             print("DIST,%s,%s,start_err,,,,,0,,,," % (mac_str(self.mac), mac_str(peer.mac)))
             log.error("ranging: ftm.start", ex)
@@ -378,6 +427,12 @@ class RangingService:
             return  # late result from a cancelled session
         r = (status, entries, peer.rssi, dist_cm, rtt_raw, rtt_est, med, mean, lo, hi)
         self._record("DIST", self.mac, peer.mac, r)
+        if status == ftm.STATUS_OK:
+            # For the next BOSF, corrected: badge os applies no bias.
+            cm = (mean * PS_TO_CM if mean else dist_cm) - self.bias_cm.get("badge", 0.0)
+            self._bos_pending.append((self.bos_sta.get(peer.mac, peer.mac), max(cm, MIN_DISTANCE_CM)))
+            if len(self._bos_pending) > _BOSF_MAX:
+                self._bos_pending.pop(0)
         # Broadcast the result like the ftm_node boards do, so every device
         # nearby gets this pair for its map. Raw values: receivers apply the
         # initiator bias themselves, by this badge's name.
@@ -385,6 +440,120 @@ class RangingService:
         self._send(struct.pack(
             _RANGE_FMT, _MAGIC, _VERSION, _RANGE, peer.mac, status, entries, rssi,
             dist_cm, rtt_raw, rtt_est, med, mean, lo, hi), "range")
+
+    # ---- badge os compatibility ----------------------------------------------
+    def _bos_ident(self, mac):
+        """A MAC from a badge os packet, as this service keys it."""
+        return self._bos_ap.get(mac, mac)
+
+    def _bos_learn(self, sta, ap):
+        """A badge os badge: station MAC sta, SoftAP (FTM responder) ap."""
+        if self._bos_ap.get(sta) == ap:
+            return
+        self._bos_ap[sta] = ap
+        self.bos_sta[ap] = sta
+        # Results about it that arrived before its BOSR are keyed by its
+        # station MAC; move them so it doesn't show up twice.
+        for key in list(self.results):
+            if sta in key:
+                new = (ap if key[0] == sta else key[0], ap if key[1] == sta else key[1])
+                self.results[new] = self.results.pop(key)
+                rtt = self.latest_rtt.pop(key, None)
+                if rtt:
+                    self.latest_rtt[new] = rtt
+
+    def _bos_pairs(self, frm, msg, off, n):
+        for k in range(n):
+            to, cm = struct.unpack_from(_BOS_PAIR, msg, off + k * _BOS_PAIR_LEN)
+            if cm < 0:
+                continue
+            to = self._bos_ident(bytes(to))
+            if to == frm:
+                continue
+            # Only a distance: put it where the per-frame mean goes, so it is
+            # used as is (receivers take mean x PS_TO_CM).
+            self._record("RDIST", frm, to, (ftm.STATUS_OK, 0, 0, cm, 0, 0, 0, int(cm / PS_TO_CM), 0, 0))
+
+    def _bos_rx(self, src, msg):
+        n = len(msg)
+        if msg[:4] == _BOSR:
+            if n < _BOSR_HEAD:
+                return
+            ap = bytes(msg[4:10])
+            cnt = msg[10]
+            tail = _BOSR_HEAD + cnt * _BOS_PAIR_LEN
+            if cnt > _BOSR_MAX or n < tail:
+                return
+            if ap == src:
+                return  # one of these badges (sent from its AP): its BBFT packets say more
+            self._bos_learn(src, ap)
+            name = None
+            if n >= tail + _BOS_NAME_LEN:
+                try:
+                    name = bytes(msg[tail:tail + _BOS_NAME_LEN]).split(b"\x00")[0].decode() or None
+                except UnicodeError:
+                    name = None
+            self._heard(ap, name, self._rssi_of(src))
+            self._bos_pairs(ap, msg, _BOSR_HEAD, cnt)
+        else:
+            if n < 5:
+                return
+            cnt = msg[4]
+            if cnt > _BOSF_MAX or n < 5 + cnt * _BOS_PAIR_LEN:
+                return
+            ap = self._bos_ap.get(src)
+            if ap is None:
+                return  # its BOSR first (also drops these badges' own BOSF)
+            self._heard(ap, None, self._rssi_of(src))
+            self._bos_pairs(ap, msg, 5, cnt)
+
+    def _bos_cm(self, cm):
+        return max(0, min(32767, int(cm + 0.5)))
+
+    async def _bos_task(self):
+        """BOSR about every second, BOSF about every 250 ms, both jittered like
+        badge os so two badges don't keep colliding. The BOSF goes out even
+        when empty: it tells badge os this badge reports its sessions, so it
+        ranges this badge every pass rather than once per 5 s."""
+        name = self.name.encode()[:_BOS_NAME_LEN]
+        while name:
+            try:  # don't cut a multi-byte character in half
+                name.decode()
+                break
+            except UnicodeError:
+                name = name[:-1]
+        name = name + b"\x00" * (_BOS_NAME_LEN - len(name))
+        beacon = fast = time.ticks_ms()
+        while True:
+            now = time.ticks_ms()
+            try:
+                if time.ticks_diff(now, beacon) >= 0:
+                    pairs = []
+                    for p in self.live_peers():
+                        d = self.distance(p.mac)
+                        if d is not None:
+                            pairs.append((self.bos_sta.get(p.mac, p.mac), d * 100))
+                        if len(pairs) == _BOSR_MAX:
+                            break
+                    msg = bytearray(_BOSR_HEAD + len(pairs) * _BOS_PAIR_LEN)
+                    struct.pack_into("<4s6sB", msg, 0, _BOSR, self.mac, len(pairs))
+                    for k, (mac, cm) in enumerate(pairs):
+                        struct.pack_into(_BOS_PAIR, msg, _BOSR_HEAD + k * _BOS_PAIR_LEN, mac, self._bos_cm(cm))
+                    self._send(bytes(msg) + name, "BOSR")
+                    beacon = time.ticks_add(now, 800 + random.getrandbits(9) % 400)
+                if time.ticks_diff(now, fast) >= 0:
+                    pend, self._bos_pending = self._bos_pending, []
+                    msg = bytearray(5 + len(pend) * _BOS_PAIR_LEN)
+                    struct.pack_into("<4sB", msg, 0, _BOSF, len(pend))
+                    for k, (mac, cm) in enumerate(pend):
+                        struct.pack_into(_BOS_PAIR, msg, 5 + k * _BOS_PAIR_LEN, mac, self._bos_cm(cm))
+                    self._send(bytes(msg), "BOSF")
+                    fast = time.ticks_add(now, 200 + random.getrandbits(7) % 100)
+            except Exception as ex:
+                print("ranging: badge os error", ex)
+                log.error("ranging: badge os error", ex)
+            wait = min(time.ticks_diff(beacon, time.ticks_ms()), time.ticks_diff(fast, time.ticks_ms()))
+            await aio.sleep_ms(max(wait, 10))
 
     async def _sync_task(self):
         """Broadcast the firefly phase and retune toward the badges nearby."""

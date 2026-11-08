@@ -1,12 +1,12 @@
 # Ranging protocol
 
-Badges (ESP32-S3, `badge/lib/ranging.py`) and `ftm_node` boards (ESP32-C3, `ftm_node/main/main.cpp`) use the same protocol.
+Badges (ESP32-S3, `badge/lib/ranging.py`) and `ftm_node` boards (ESP32-C3, `ftm_node/main/main.cpp`) use the same protocol. Badges also speak the [badge os](https://github.com/yigitabi5444/supercon26-badge-os) ranging protocol, so they work with badges running badge os too (see [badge os compatibility](#badge-os-compatibility)).
 
 ## Radio setup
 
 Each device:
 
-* Runs a hidden, open softAP on Wi-Fi channel 6. The SSID is the device name. The FTM responder is on.
+* Runs a hidden, open softAP on Wi-Fi channel 1, which badge os uses and can't change. On badges, `"ranging_channel"` in `settings.json` overrides it, but then the badge can't reach badge os badges, or nodes on channel 1. The SSID is the device name. The FTM responder is on.
 * Sends and receives ESP-NOW broadcasts (`ff:ff:ff:ff:ff:ff`) on the AP interface. The ESP-NOW sender MAC is therefore the AP MAC, which is the address other devices range to.
 * Turns STA power save off.
 
@@ -53,8 +53,8 @@ The result of one FTM session. The sender is the initiator, and `to` is the resp
 | 35 | u32 | `rtt_min_ps` |
 | 39 | u32 | `rtt_max_ps` |
 
-* Sent only by `ftm_node` boards, once after every session, including failed ones.
-* Badges do not send RANGE. They record received RANGE messages as measurements between the two nodes, which puts node-to-node pairs on the map.
+* Sent by badges and `ftm_node` boards, once after every session, including failed ones. Values are raw: receivers subtract the initiator's bias.
+* Receivers record RANGE messages as measurements between the two devices, which puts pairs between other devices on the map.
 * A RANGE message also counts as hearing the sender. It doesn't carry a name.
 
 ### SYNC (type 4), 14 bytes
@@ -77,7 +77,7 @@ Each device runs one FTM initiator session at a time:
 1. Drop peers not heard for 10 s. Drop measurements older than 30 s.
 2. With no peers, wait for the first beacon.
 3. Pick the next peer, round robin.
-4. Start an FTM session to the peer's AP MAC on channel 6: 16 frames, burst period 0 (no preference). The session must finish within 1000 ms, or it is cancelled and logged as `timeout`. A session usually takes 100–300 ms.
+4. Start an FTM session to the peer's AP MAC on channel 1: 16 frames, burst period 0 (no preference). The session must finish within 1000 ms, or it is cancelled and logged as `timeout`. A session usually takes 100–300 ms.
 5. Record the result, then start the next session at once. There is no gap between sessions.
 
 A full pass ranges each peer once. With N peers, a pass takes about N × 0.1–0.3 s, plus 1 s for each timeout.
@@ -91,11 +91,49 @@ distance_cm = rtt_mean_ps × 0.0149896229      (falls back to dist_cm if the mea
 corrected   = max(distance_cm − bias(initiator), 5 cm)
 ```
 
-* The bias depends on the initiator's chip: badge 1.9 m, node 0 m. A peer is a node if its name starts with `node-`. Override with `"initiator_bias_m": {"badge": ..., "node": ...}` in `settings.json`.
+* The bias depends on the initiator: badge 1.9 m, node 0 m, badge os badge 0 m. A peer is a node if its name starts with `node-`, and a badge os badge if it sent a BOSR. Override with `"initiator_bias_m": {"badge": ..., "node": ..., "badgeos": ...}` in `settings.json`.
 * The last 3 results are kept per directed pair (A→B and B→A separately).
 * List distance (this badge to a peer): the median of this badge's last 3 results to that peer.
 * Map edge A–B: the median of the fresh results in both directions, up to 6 values.
 * The map fits 2D positions to all edges (`badge/lib/graph_layout.py`, with a C solver in `user_c_modules/graphlayout`).
+
+## badge os compatibility
+
+[badge os](https://github.com/yigitabi5444/supercon26-badge-os) (`main/main.c`, "Ranging") is a C firmware for the same badge. Its ranging works the same way: ESP-NOW broadcasts to find each other, a hidden softAP as the FTM responder, and shared results. The packets are different. Badges send and receive both kinds. `ftm_node` boards speak only `BBFT`.
+
+badge os sends from its station interface, so its ESP-NOW sender MAC is its station MAC. It names badges by that MAC in its pairs too. Its BOSR carries the softAP MAC, which is the one FTM goes to. Badges key a badge os badge by its softAP MAC and map its station MAC to it. Badges send BOSR and BOSF from the AP interface, so to badge os, a badge's station MAC and softAP MAC are the same.
+
+Packed, little-endian, with no version byte. A pair is `u8[6] mac, i16 cm`. A cm of −1 means heard but not measured yet.
+
+### BOSR, 11 + 8n + 12 bytes
+
+| Offset | Type | Field |
+|---|---|---|
+| 0 | char[4] | magic `BOSR` |
+| 4 | u8[6] | sender's softAP MAC, where to aim FTM |
+| 10 | u8 | n, at most 8 |
+| 11 | pair[n] | the sender's own latest distances |
+| 11 + 8n | char[12] | username, NUL-padded. Badge os before v0.7 leaves it out |
+
+* badge os sends it every 0.8–1.2 s. A badge sends it at the same rate, with its 8 nearest list distances (bias already subtracted) and its name cut to 12 bytes.
+* Receiving one adds the sender as a peer and records its pairs. A BOSR whose sender MAC equals its softAP MAC comes from a badge, and is ignored, since that badge's `BBFT` packets say more.
+* A badge os badge without a username shows as the last 2 bytes of its station MAC in hex, as on its own Radar.
+
+### BOSF, 5 + 8n bytes
+
+| Offset | Type | Field |
+|---|---|---|
+| 0 | char[4] | magic `BOSF` |
+| 4 | u8 | n, at most 16 |
+| 5 | pair[n] | results of the sessions finished since the last BOSF |
+
+* badge os sends it every 200–300 ms, even when empty. A badge does the same, with each successful own session's distance, bias subtracted.
+* badge os ranges a badge that sends no BOSF only once per 5 s. It skips ranging a badge for 400 ms after that badge's BOSF reports a result to it.
+* Receivers ignore BOSF from a sender with no BOSR yet.
+
+### Distances
+
+badge os sends driver distance estimates (`dist_est`), the minimum of its last 4 results, with no offset. Badges record each received pair as a result, like RANGE, and log it as `RDIST` with only `dist_cm` set. A BOSR repeats the sender's latest distances every second, so the last 3 results of a badge os pair are mostly the same value.
 
 ## LED sync (firefly)
 
