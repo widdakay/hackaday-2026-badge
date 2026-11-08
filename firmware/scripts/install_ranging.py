@@ -2,8 +2,8 @@
 """Add the Ranging app to a badge running the stock Hack-a-Day firmware,
 keeping everything else on it: apps, nametag, gallery, data.
 
-    pip install esptool mpremote
-    python install_ranging.py            # badge plugged in over USB
+    python3 -m pip install esptool mpremote
+    python3 install_ranging.py           # badge plugged in over USB
 
 What it does:
 
