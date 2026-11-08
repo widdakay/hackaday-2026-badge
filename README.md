@@ -1,17 +1,17 @@
 ![Billboard_Badge](assets/frame_graphic_demo.png "2026 Hackaday Supercon Billboard Badge")
 
-# Ranging: badges that know where each other are
+# Ranging
 
-This firmware adds a **Ranging** app. Badges find each other over Wi-Fi and measure the distance between them with Wi-Fi Fine Timing Measurement (802.11mc). No network is needed.
+The Ranging app measures distances between badges with Wi-Fi FTM (802.11mc). It shows:
 
-* A list of every badge nearby, with its name and distance
-* A live map of everyone's positions
-* Your nametag, with your name set in `data/settings.json`
-* Firefly LEDs: nearby badges gradually sync up their flashes until they ripple together
+* Nearby badges, with name and distance
+* A map of badge positions
+* A nametag, with the name from `data/settings.json`
+* LED flashes synced between nearby badges
 
-The badge boots into Ranging and keeps measuring in the background while you use other apps. The firmware also adds an app bar with a battery icon, faster screen refreshes, and fixes for button and app-switching bugs.
+Ranging runs in the background when other apps are open. Also added: an app bar with a battery icon, faster display refresh, and button and app-switching fixes.
 
-**[Install instructions →](firmware/README.md#installing)**
+Install: [firmware/README.md](firmware/README.md#installing)
 
 # Badge Hardware
 The badge uses a 9.7 inch Pervasive Displays E2969JS0B1 electronic paper panel that was recycled from price tags which were destined for a now bankrupt German department store chain, coupled with an ESP32-S3 microcontroller.

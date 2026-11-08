@@ -2,19 +2,17 @@
 
 ## Installing
 
-The installer adds Ranging to a stock badge and keeps everything already on it (apps, nametag, gallery, data). It flashes only the MicroPython app image, which is stock MicroPython plus the `ftm` and `graphlayout` modules, from the [latest release](https://github.com/widdakay/hackaday-2026-badge/releases/latest), then copies in the Ranging files. It backs up your code and settings first, and asks for the name to show.
-
 ```sh
 pip install esptool mpremote
-python scripts/install_ranging.py        # badge plugged in over USB
+python scripts/install_ranging.py
 ```
 
-Options: `--port`, `--name NAME`, `--local` (use the files in this repo, not the release). The top of `scripts/install_ranging.py` lists the rest, and how to undo the install.
+`install_ranging.py` downloads the [latest release](https://github.com/widdakay/hackaday-2026-badge/releases/latest), backs up the badge's code and settings, and flashes the app partition only (MicroPython plus the `ftm` and `graphlayout` modules). Then it copies the Ranging files and asks for your name. Existing files on the badge are not changed. Options: `--port`, `--name NAME`, `--local`. Uninstall steps are in the script header.
 
-* Ranging only finds badges that run this firmware. ESP32-C3 boards running [`ftm_node`](ftm_node/README.md) also show up, as fixed reference points.
-* Your name is in `/data/settings.json` on the badge: `{"name": "..."}`, up to 16 bytes.
-* Developers working from this repo: `python scripts/update.py push --reset` syncs all of `badge/` to the badge.
-* Crash log: `mpremote cp :data/log.txt .`, then press RESET.
+* Ranging finds only badges with this firmware and [`ftm_node`](ftm_node/README.md) boards.
+* The name is in `/data/settings.json` on the badge, 16 bytes max.
+* `python scripts/update.py push --reset` copies all of `badge/` to the badge.
+* Crash log: `mpremote cp :data/log.txt .`
 
 # Micropython
 Baseline micropython 1.27 (stock MicroPython, without the `ftm` module, so no Ranging)
